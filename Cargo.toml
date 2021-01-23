@@ -9,3 +9,13 @@ edition = "2018"
 [dependencies]
 futures = {version = "0.3.8", features = ["thread-pool"]}
 chashmap = "2.2.2"
+maplit = "1.0.2"
+
+
+[dev-dependencies]
+criterion = "0.3.3"
+lang3 = {path = "."}
+
+[[bench]]
+name = "query_overhead"
+harness = false
