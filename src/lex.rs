@@ -21,6 +21,7 @@ pub enum TokenType {
     OpenBrace,
     CloseBrace,
     Equal,
+    Plus,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -155,6 +156,7 @@ pub(crate) fn lex(mut s: &str) -> Result<Vec<Token>> {
         Box::new(Punctuation{c: '{', t: TokenType::OpenBrace}),
         Box::new(Punctuation{c: '}', t: TokenType::CloseBrace}),
         Box::new(Punctuation{c: '=', t: TokenType::Equal}),
+        Box::new(Punctuation{c: '+', t: TokenType::Plus}),
     ];
 
     let mut tokens: Vec<Token> = Vec::new();
@@ -204,8 +206,10 @@ impl GetTokenStream {
 }
 
 mod test {
+    #[cfg(test)]
     use crate::make_query;
 
+    #[cfg(test)]
     use super::*;
 
     #[test]
@@ -227,7 +231,7 @@ mod test {
 
     #[test]
     fn test_lex_mixed() {
-        assert_eq!(lex("hello goodbye   123 if loop else 234,; dj23 \"h£ello\"_23\n43\n loophello\t72jsd"), Ok(vec![
+        assert_eq!(lex("hello goodbye   123 if loop else 234,; dj23 \"h£ello\"_23\n43\n loophello\t72jsd +"), Ok(vec![
             Token{t: TokenType::Ident("hello".to_string())},
             Token{t: TokenType::Ident("goodbye".to_string())},
             Token{t: TokenType::Int("123".to_string())},
@@ -244,9 +248,11 @@ mod test {
             Token{t: TokenType::Ident("loophello".to_string())},
             Token{t: TokenType::Int("72".to_string())},
             Token{t: TokenType::Ident("jsd".to_string())},
+            Token{t: TokenType::Plus},
         ]));
     }
 
+    #[cfg(test)]
     use futures::executor::block_on;
     #[test]
     fn test_as_query() {

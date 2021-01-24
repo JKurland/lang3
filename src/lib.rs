@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use chashmap::CHashMap;
 use futures::channel::oneshot::{channel, Sender, Receiver};
 use futures::executor::ThreadPool;
@@ -14,6 +16,7 @@ pub(crate) mod lex;
 pub(crate) mod itemise;
 pub(crate) mod function;
 pub(crate) mod vm;
+
 
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct Error {
@@ -165,7 +168,6 @@ mod tests {
         let tokens = lex::lex(src)?;
         let ast = function::parse_body(&tokens)?;
         let graph = function::Graph::from_function_ast_u32(&ast)?;
-        dbg!(&graph);
         let program = graph.vm_program()?;
         let mut vm = vm::Vm::new(8092);
         Ok(vm.run(&program) as u32)
@@ -175,5 +177,6 @@ mod tests {
     fn end_to_end() {
         assert_eq!(run("return 3;"), Ok(3));
         assert_eq!(run("return 3 + 2;"), Ok(5));
+        assert_eq!(run("return 3 + 2 + 5 + 10;"), Ok(20));
     }
 }

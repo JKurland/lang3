@@ -22,6 +22,7 @@ pub(crate) enum MoveArg {
     ValA,
     ValB,
     AddResult,
+    AddU32Result,
     EqResult,
 
     DataAddressA,
@@ -142,6 +143,7 @@ impl Vm {
                 MoveArg::ValA => DataSource::Word(self.val_a),
                 MoveArg::ValB => DataSource::Word(self.val_b),
                 MoveArg::AddResult => DataSource::Word(self.val_a + self.val_b),
+                MoveArg::AddU32Result => DataSource::Half((self.val_a + self.val_b) as u32),
                 MoveArg::EqResult => DataSource::Word((self.val_a == self.val_b) as u64),
 
                 MoveArg::DataAddressA => DataSource::Word(self.data_address_a),
@@ -174,6 +176,7 @@ impl Vm {
                 MoveArg::ValA => DataSink::Register(&mut self.val_a),
                 MoveArg::ValB => DataSink::Register(&mut self.val_b),
                 MoveArg::AddResult => panic!("Invalid Dest"),
+                MoveArg::AddU32Result => panic!("Invalid Dest"),
                 MoveArg::EqResult => panic!("Invalid Dest"),
 
                 MoveArg::DataAddressA => DataSink::Register(&mut self.data_address_a),
@@ -190,7 +193,6 @@ impl Vm {
                 MoveArg::Halt => DataSink::Halt,
             };
 
-            dbg!(&src, &dst);
             match (src, dst) {
                 (DataSource::Byte(value), DataSink::Register(reg)) => *reg = value as u64,
                 (DataSource::Byte(value), DataSink::Slice(data, len)) => unsafe {data.write_bytes(value, len)},

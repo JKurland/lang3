@@ -117,8 +117,11 @@ impl GetGlobalItems {
 
 
 mod test {
+    #[cfg(test)]
     use super::*;
+    #[cfg(test)]
     use crate::lex::lex;
+    #[cfg(test)]
     use maplit::hashmap;
 
     #[test]

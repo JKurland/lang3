@@ -1,10 +1,8 @@
-use futures::channel::mpsc::Receiver;
-
 use crate::itemise::{ItemPath, GetGlobalItems, ItemType};
 use crate::lex::{Token, TokenType};
 use crate::{Result, Error, Query, Program, make_query};
 use crate::vm;
-use std::{collections::HashMap, sync::Arc, collections::HashSet};
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug)]
 enum FunctionItemType {
@@ -48,6 +46,10 @@ enum FunctionAstType {
         ident: String,
         value: Box<FunctionAst>,
     },
+    Add {
+        lhs: Box<FunctionAst>,
+        rhs: Box<FunctionAst>,
+    },
 }
 #[derive(Debug)]
 pub(crate) struct FunctionAst {
@@ -76,7 +78,6 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
     let mut state = State::NewItem;
     let mut items = Vec::new();
     for (idx, token) in token_stream.iter().enumerate() {
-        dbg!(idx, token, &state);
         let new_state = match state {
             State::NewItem => {
                 item_start_idx = idx;
@@ -205,15 +206,16 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
         } else {
             state = new_state;
         }
-
     }
-    Ok(items)
+
+    match state {
+        State::NewItem => Ok(items),
+        _ => Err(Error::new("Unexpected end of item")),
+    }
 }
 
 pub(crate) fn parse_body(token_stream: &[Token]) -> Result<FunctionAst> {
-    dbg!(token_stream);
     let items = itemise_function(token_stream)?;
-    dbg!(&items);
     Ok(FunctionAst{t: FunctionAstType::Scope{
         items: items
                 .iter()
@@ -337,21 +339,60 @@ fn parse_if(token_stream: &[Token]) -> Result<FunctionAst> {
     }})
 }
 
-fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
-    if token_stream.len() != 2 {
-        return Err(Error::new("Invalid expression"));
-    }
+enum OperatorType {
+    Add,
+}
 
-    match token_stream.get(0) {
-        None => Err(Error::new("Expected something")),
-        Some(token) => {
-            match token.t {
+struct Operator {
+    t: OperatorType,
+    idx: usize,
+    priority: (usize, usize),
+}
+
+fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: usize, right_end: usize) -> Result<FunctionAst> {
+    if let Some((root_op_idx, root_op)) = operators.iter().enumerate().min_by_key(|o| o.1.priority) {
+        match root_op.t {
+            OperatorType::Add => {
+                Ok(FunctionAst{t: FunctionAstType::Add{
+                    lhs: Box::new(parse_expr_inner(&operators[..root_op_idx], token_stream, left_end, root_op.idx - 1)?),
+                    rhs: Box::new(parse_expr_inner(&operators[root_op_idx + 1..], token_stream, root_op.idx + 1, right_end)?),
+                }})
+            }
+        }
+    } else {
+        if left_end != right_end {
+            Err(Error::new("Invalid expression, expected literal"))
+        } else {
+            match token_stream[left_end].t {
                 TokenType::Int(ref s) => Ok(FunctionAst{t: FunctionAstType::U32(parse_u32(&s))}),
                 TokenType::String(ref s) => Ok(FunctionAst{t: FunctionAstType::StringLiteral(s.clone())}),
                 _ => Err(Error::new("Unexpected token in expr"))
             }
         }
     }
+}
+
+fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
+    assert!(token_stream.last() == Some(&Token{t: TokenType::SemiColon}));
+    let expr_body = &token_stream[0..token_stream.len()-1];
+
+
+    // find the operators in the expression
+    let mut operators = Vec::new();
+    operators.reserve(expr_body.len());
+    for (idx, token) in expr_body.iter().enumerate() {
+        match token.t {
+            TokenType::Plus => operators.push(Operator{
+                t: OperatorType::Add,
+                idx,
+                priority: (0, 10),
+            }),
+            _ => {},
+        }
+    }
+
+    // fill in the lhs and rhs of each operator
+    parse_expr_inner(&operators, expr_body, 0, expr_body.len() - 1)
 }
 
 fn parse_u32(s: &str) -> u32 {
@@ -364,6 +405,11 @@ fn parse_u32(s: &str) -> u32 {
 #[derive(Debug)]
 enum InstructionType {
     Eq{
+        dest: ObjectHandle,
+        lhs: ObjectHandle,
+        rhs: ObjectHandle,
+    },
+    Add{
         dest: ObjectHandle,
         lhs: ObjectHandle,
         rhs: ObjectHandle,
@@ -530,12 +576,11 @@ impl Graph {
     }
     fn new_object(&mut self) -> ObjectHandle {
         self.objects.push(Object{t: None});
-        ObjectHandle(self.blocks.len() - 1)
+        ObjectHandle(self.objects.len() - 1)
     }
 
     fn from_function_ast(ast: &FunctionAst, return_type: Type) -> Result<Self> {
         let mut graph = Self::new();
-        dbg!(ast);
         graph.add_flow(ast, graph.entry_block(), &Labels{break_: None})?;
 
         InferenceSystem::add_types(&mut graph, return_type)?;
@@ -553,14 +598,29 @@ impl Graph {
         Self::from_function_ast(ast, Type::U32)
     }
 
-    fn evaluate_and_store(&mut self, ast: &FunctionAst, current_block: BlockHandle, object_handle: ObjectHandle) -> Result<BlockHandle> {
-        let block = self.block_mut(current_block);
+    fn evaluate_and_store(&mut self, ast: &FunctionAst, mut current_block: BlockHandle, object_handle: ObjectHandle) -> Result<BlockHandle> {
         match ast.t {
             FunctionAstType::U32(i) => {
-                block.instructions.push(Instruction{t: InstructionType::StoreU32(object_handle, i)})
+                let block = self.block_mut(current_block);
+                block.instructions.push(Instruction{t: InstructionType::StoreU32(object_handle, i)});
             },
             FunctionAstType::StringLiteral(ref s) => {
-                block.instructions.push(Instruction{t: InstructionType::StoreString(object_handle, s.clone())})
+                let block = self.block_mut(current_block);
+                block.instructions.push(Instruction{t: InstructionType::StoreString(object_handle, s.clone())});
+            },
+            FunctionAstType::Add{ref lhs, ref rhs} => {
+                let lhs_obj = self.new_object();
+                current_block = self.evaluate_and_store(&*lhs, current_block, lhs_obj)?;
+
+                let rhs_obj = self.new_object();
+                current_block = self.evaluate_and_store(&*rhs, current_block, rhs_obj)?;
+
+                let block = self.block_mut(current_block);
+                block.instructions.push(Instruction{t: InstructionType::Add{
+                    dest: object_handle,
+                    lhs: lhs_obj,
+                    rhs: rhs_obj,
+                }});
             },
             _ => return Err(Error::new("Invalid expression"))
         }
@@ -629,6 +689,7 @@ impl Graph {
             },
             FunctionAstType::U32(_) => Err(Error::new("Unexpected int")),
             FunctionAstType::StringLiteral(_) => Err(Error::new("Unexpected string")),
+            FunctionAstType::Add{..} => Err(Error::new("Unexpected add")),
             FunctionAstType::Return(ref value) => {
                 let return_obj = self.new_object();
                 let after_eval_block = self.evaluate_and_store(&*value, current_block, return_obj)?;
@@ -649,11 +710,10 @@ impl Graph {
 
     pub(crate) fn vm_program(&self) -> Result<vm::Program> {
         let mut prog = vm::Program::new();
-        let stack_offsets_iter = self.objects.iter()
+        let stack_offsets: Vec<usize> = self.objects.iter()
             .map(|o| o.t.as_ref().unwrap().size())
-            .scan(0, |total, size| {*total += size; Some(*total - size)});
-        let stack_offsets: Vec<usize> = std::iter::once(0).chain(stack_offsets_iter).collect();
-
+            .scan(0, |total, size| {*total += size; Some(*total - size)})
+            .collect();
         
         let move_arg_for = |o: ObjectHandle| -> vm::MoveArg {
             vm::MoveArg::Stack{offset: stack_offsets[o.0] as i64, len: self.objects[o.0].t.as_ref().unwrap().size() as u64}
@@ -689,7 +749,7 @@ impl Graph {
                         instructions.push(vm::Instruction{
                             src: vm::MoveArg::EqResult,
                             dst: move_arg_for(dest),
-                        })
+                        });
                     },
                     InstructionType::StoreU32(dest, value) => {
                         instructions.push(vm::Instruction{
@@ -708,7 +768,23 @@ impl Graph {
                         instructions.push(vm::Instruction{
                             src: vm::MoveArg::Word(val.len() as u64),
                             dst: move_arg_for_len(*dest, 8, 8),
-                        })
+                        });
+                    },
+                    InstructionType::Add{dest, lhs, rhs} => {
+                        instructions.push(vm::Instruction{
+                            src: move_arg_for(lhs),
+                            dst: vm::MoveArg::ValA,
+                        });
+
+                        instructions.push(vm::Instruction{
+                            src: move_arg_for(rhs),
+                            dst: vm::MoveArg::ValB,
+                        });
+
+                        instructions.push(vm::Instruction{
+                            src: vm::MoveArg::AddU32Result,
+                            dst: move_arg_for(dest),
+                        });
                     },
                 }
             }
@@ -759,7 +835,6 @@ impl Graph {
                 },
             }
         }
-        dbg!(&blocks);
         prog.instructions.extend(blocks.into_iter().flatten());
         Ok(prog)
     }
@@ -837,10 +912,15 @@ impl InferenceSystem {
                     },
                     InstructionType::StoreU32(dest, _) => {
                         is.add_eqn(Type::Placeholder(dest), Type::U32);
-                    }
+                    },
                     InstructionType::StoreString(dest, _) => {
                         is.add_eqn(Type::Placeholder(dest), Type::String);
-                    }
+                    },
+                    InstructionType::Add{dest, lhs, rhs} => {
+                        is.add_eqn(Type::Placeholder(lhs), Type::U32);
+                        is.add_eqn(Type::Placeholder(rhs), Type::U32);
+                        is.add_eqn(Type::Placeholder(dest), Type::U32);
+                    },
                 }
             }
 
