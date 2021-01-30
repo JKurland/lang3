@@ -144,7 +144,7 @@ impl Vm {
                 MoveArg::ValB => DataSource::Word(self.val_b),
                 MoveArg::AddResult => DataSource::Word(self.val_a + self.val_b),
                 MoveArg::AddU32Result => DataSource::Half((self.val_a + self.val_b) as u32),
-                MoveArg::EqResult => DataSource::Word((self.val_a == self.val_b) as u64),
+                MoveArg::EqResult => DataSource::Byte((self.val_a == self.val_b) as u8),
 
                 MoveArg::DataAddressA => DataSource::Word(self.data_address_a),
                 MoveArg::DataLenA => DataSource::Word(self.data_len_a),

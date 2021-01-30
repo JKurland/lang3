@@ -163,20 +163,154 @@ macro_rules! make_query {
 
 mod tests {
     use super::*;
+    use futures::executor::block_on;
+    use function::GetFunctionVmProgram;
+    use itemise::ItemPath;
+
+
+    fn run_main(src: &str) -> Result<u32> {
+        let prog = Arc::new(Program::new(src.to_string()));
+        let program_arc = block_on(make_query!(&prog, GetFunctionVmProgram{
+            path: ItemPath::new("main"),
+        }));
+
+        if program_arc.is_err() {
+            return Err(program_arc.as_ref().as_ref().unwrap_err().clone());
+        }
+        let program = program_arc.as_ref().as_ref().unwrap();
+
+        let mut vm = vm::Vm::new(8092);
+        Ok(vm.run(&program) as u32)
+    }
 
     fn run(src: &str) -> Result<u32> {
         let tokens = lex::lex(src)?;
         let ast = function::parse_body(&tokens)?;
-        let graph = function::Graph::from_function_ast_u32(&ast)?;
+        let graph = function::Graph::from_function_ast(&ast, function::Type::U32)?;
         let program = graph.vm_program()?;
         let mut vm = vm::Vm::new(8092);
         Ok(vm.run(&program) as u32)
     }
 
     #[test]
-    fn end_to_end() {
+    fn function_body() {
         assert_eq!(run("return 3;"), Ok(3));
         assert_eq!(run("return 3 + 2;"), Ok(5));
         assert_eq!(run("return 3 + 2 + 5 + 10;"), Ok(20));
+    }
+
+    #[test]
+    fn end_to_end1() {
+        assert_eq!(run_main(
+            r#"
+            fn main() -> u32 {
+                return 3;
+            }"#
+        ), Ok(3));
+    }
+
+    #[test]
+    fn end_to_end2() {
+        assert_eq!(run_main(
+            r#"
+            fn main() -> u32 {
+                return 3 + 2;
+            }"#
+        ), Ok(5));
+    }
+
+    #[test]
+    fn end_to_end3() {
+        assert_eq!(run_main(
+            r#"
+            struct s {
+                
+            }
+
+            fn main() -> u32 {
+                return 3 + 2;
+            }"#
+        ), Ok(5));
+    }
+
+    #[test]
+    fn end_to_end4() {
+        assert_eq!(run_main(
+            r#"
+            fn main() -> u32 {
+                let i = 2;
+                return i;
+            }"#
+        ), Ok(2));
+    }
+
+    #[test]
+    fn end_to_end5() {
+        assert_eq!(run_main(
+            r#"
+            fn main() -> u32 {
+                let i = 2;
+                i = i + 1;
+                return i;
+            }"#
+        ), Ok(3));
+    }
+
+    #[test]
+    fn end_to_end6() {
+        assert_eq!(run_main(
+            r#"
+            fn main() -> u32 {
+                let i = 2;
+                i = i + i;
+                return 2 + i;
+            }"#
+        ), Ok(6));
+    }
+
+    #[test]
+    fn end_to_end7() {
+        assert_eq!(run_main(
+            r#"
+            fn main() -> u32 {
+                let i = 2;
+                if i == 2 {
+                    i = 3;
+                } else {
+                    i = 1;
+                }
+                return i;
+            }"#
+        ), Ok(3));
+    }
+
+    #[test]
+    fn end_to_end8() {
+        assert_eq!(run_main(
+            r#"
+            fn main() -> u32 {
+                let i = 2;
+                if i == 3 {
+                    i = 3;
+                } else {
+                    i = 1;
+                }
+                return i;
+            }"#
+        ), Ok(1));
+    }
+
+    #[test]
+    fn end_to_end9() {
+        assert_eq!(run_main(
+            r#"
+            fn main() -> u32 {
+                let i = 2;
+                if i == 3 {
+                    i = 3;
+                }
+                return i;
+            }"#
+        ), Ok(2));
     }
 }

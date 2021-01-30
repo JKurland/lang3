@@ -1,8 +1,9 @@
-use crate::itemise::{ItemPath, GetGlobalItems, ItemType};
+use crate::itemise::{self, GetGlobalItems, ItemPath, ItemType};
 use crate::lex::{Token, TokenType};
 use crate::{Result, Error, Query, Program, make_query};
 use crate::vm;
 use std::{collections::HashMap, sync::Arc};
+use futures::join;
 
 #[derive(Debug)]
 enum FunctionItemType {
@@ -26,6 +27,7 @@ struct FunctionItem<'a> {
 enum FunctionAstType {
     U32 (u32),
     StringLiteral(String),
+    VarName(String),
     Return(Box<FunctionAst>),
     IfStatement {
         condition: Box<FunctionAst>,
@@ -40,6 +42,7 @@ enum FunctionAstType {
     },
     Let {
         ident: String,
+        t: Option<Type>,
         value: Box<FunctionAst>,
     },
     Assign {
@@ -47,6 +50,10 @@ enum FunctionAstType {
         value: Box<FunctionAst>,
     },
     Add {
+        lhs: Box<FunctionAst>,
+        rhs: Box<FunctionAst>,
+    },
+    DoubleEq {
         lhs: Box<FunctionAst>,
         rhs: Box<FunctionAst>,
     },
@@ -65,6 +72,7 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
         Expr,
         IfBody,
         Return,
+        LetBeforeEq,
         Let,
         Assign,
         Skip(usize, Box<State>),
@@ -86,14 +94,7 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
                     TokenType::Loop => State::LoopSignature,
                     TokenType::OpenBrace => State::Body(FunctionItemType::Scope),
                     TokenType::Return => State::Return,
-                    TokenType::Let => {
-                        let ident = token_stream.get(idx + 1).ok_or(Error::new("Expected ident after let"))?;
-                        let eq = token_stream.get(idx + 2).ok_or(Error::new("Expected = after let"))?;
-                        match (&ident.t, &eq.t) {
-                            (TokenType::Ident(_), TokenType::Equal) => State::Skip(2, Box::new(State::Let)),
-                            _ => return Err(Error::new("Expected ident and = after let")),
-                        }
-                    },
+                    TokenType::Let => State::LetBeforeEq,
                     TokenType::Ident(_) => {
                         if let Some(next) = token_stream.get(idx + 1) {
                             match next.t {
@@ -180,6 +181,12 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
                     _ => State::Return,
                 }
             },
+            State::LetBeforeEq => {
+                match token.t {
+                    TokenType::Equal => State::Let,
+                    _ => State::LetBeforeEq,
+                }
+            },
             State::Let => {
                 match token.t {
                     TokenType::OpenBrace => State::InnerScope(1, Box::new(State::Let)),
@@ -264,15 +271,32 @@ fn parse_return(token_stream: &[Token]) -> Result<FunctionAst> {
 
 fn parse_let(token_stream: &[Token]) -> Result<FunctionAst> {
     assert_eq!(token_stream.get(0), Some(&Token{t: TokenType::Let}));
+
     let ident = match token_stream.get(1).unwrap().t {
         TokenType::Ident(ref s) => s.clone(),
-        _ => panic!("Found invalid let item"),
+        _ => return Err(Error::new("Expected ident after let")),
     };
 
-    assert_eq!(token_stream.get(2), Some(&Token{t: TokenType::Equal}));
-    Ok(FunctionAst {
-        t: FunctionAstType::Let{ident, value: Box::new(parse_expr(&token_stream[3..])?)}
-    })
+    let eq_idx = token_stream.iter()
+        .enumerate()
+        .find_map(|(idx, token)| {
+            if token.t == TokenType::Equal {
+                Some(idx)
+            } else {
+                None
+            }
+        });
+    
+    match eq_idx {
+        Some(i) => {
+            Ok(FunctionAst{t: FunctionAstType::Let{
+                ident,
+                t: None,
+                value: Box::new(parse_expr(&token_stream[i + 1..])?),
+            }})
+        },
+        None => Err(Error::new("Expected = after let")),
+    }
 }
 
 fn parse_assign(token_stream: &[Token]) -> Result<FunctionAst> {
@@ -311,7 +335,7 @@ fn parse_if(token_stream: &[Token]) -> Result<FunctionAst> {
         },
         Some(else_pos) => {
             // todo, check the position of the else is correct during function body itemisation
-            &token_stream[open_brace_pos+1..else_pos]
+            &token_stream[open_brace_pos+1..else_pos-1]
         }
     };
 
@@ -341,12 +365,13 @@ fn parse_if(token_stream: &[Token]) -> Result<FunctionAst> {
 
 enum OperatorType {
     Add,
+    DoubleEq,
 }
 
 struct Operator {
     t: OperatorType,
     idx: usize,
-    priority: (usize, usize),
+    priority: (i32, i32),
 }
 
 fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: usize, right_end: usize) -> Result<FunctionAst> {
@@ -354,6 +379,12 @@ fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: us
         match root_op.t {
             OperatorType::Add => {
                 Ok(FunctionAst{t: FunctionAstType::Add{
+                    lhs: Box::new(parse_expr_inner(&operators[..root_op_idx], token_stream, left_end, root_op.idx - 1)?),
+                    rhs: Box::new(parse_expr_inner(&operators[root_op_idx + 1..], token_stream, root_op.idx + 1, right_end)?),
+                }})
+            },
+            OperatorType::DoubleEq => {
+                Ok(FunctionAst{t: FunctionAstType::DoubleEq{
                     lhs: Box::new(parse_expr_inner(&operators[..root_op_idx], token_stream, left_end, root_op.idx - 1)?),
                     rhs: Box::new(parse_expr_inner(&operators[root_op_idx + 1..], token_stream, root_op.idx + 1, right_end)?),
                 }})
@@ -366,15 +397,19 @@ fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: us
             match token_stream[left_end].t {
                 TokenType::Int(ref s) => Ok(FunctionAst{t: FunctionAstType::U32(parse_u32(&s))}),
                 TokenType::String(ref s) => Ok(FunctionAst{t: FunctionAstType::StringLiteral(s.clone())}),
-                _ => Err(Error::new("Unexpected token in expr"))
+                TokenType::Ident(ref s) => Ok(FunctionAst{t: FunctionAstType::VarName(s.clone())}),
+                _ => Err(Error::new("Unexpected token in expr")),
             }
         }
     }
 }
 
 fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
-    assert!(token_stream.last() == Some(&Token{t: TokenType::SemiColon}));
-    let expr_body = &token_stream[0..token_stream.len()-1];
+    let expr_body = if token_stream.last() == Some(&Token{t: TokenType::SemiColon}) {
+        &token_stream[0..token_stream.len()-1]
+    } else {
+        token_stream
+    };
 
 
     // find the operators in the expression
@@ -386,6 +421,11 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
                 t: OperatorType::Add,
                 idx,
                 priority: (0, 10),
+            }),
+            TokenType::DoubleEq => operators.push(Operator{
+                t: OperatorType::DoubleEq,
+                idx,
+                priority: (0, 0),
             }),
             _ => {},
         }
@@ -416,6 +456,10 @@ enum InstructionType {
     },
     StoreU32(ObjectHandle, u32),
     StoreString(ObjectHandle, String),
+    Copy{
+        src: ObjectHandle,
+        dst: ObjectHandle,
+    },
 }
 
 #[derive(Debug)]
@@ -579,7 +623,7 @@ impl Graph {
         ObjectHandle(self.objects.len() - 1)
     }
 
-    fn from_function_ast(ast: &FunctionAst, return_type: Type) -> Result<Self> {
+    pub(crate) fn from_function_ast(ast: &FunctionAst, return_type: Type) -> Result<Self> {
         let mut graph = Self::new();
         graph.add_flow(ast, graph.entry_block(), &Labels{break_: None})?;
 
@@ -592,10 +636,6 @@ impl Graph {
         }
 
         Ok(graph)
-    }
-
-    pub(crate) fn from_function_ast_u32(ast: &FunctionAst) -> Result<Self> {
-        Self::from_function_ast(ast, Type::U32)
     }
 
     fn evaluate_and_store(&mut self, ast: &FunctionAst, mut current_block: BlockHandle, object_handle: ObjectHandle) -> Result<BlockHandle> {
@@ -621,6 +661,25 @@ impl Graph {
                     lhs: lhs_obj,
                     rhs: rhs_obj,
                 }});
+            },
+            FunctionAstType::DoubleEq{ref lhs, ref rhs} => {
+                let lhs_obj = self.new_object();
+                current_block = self.evaluate_and_store(&*lhs, current_block, lhs_obj)?;
+
+                let rhs_obj = self.new_object();
+                current_block = self.evaluate_and_store(&*rhs, current_block, rhs_obj)?;
+
+                let block = self.block_mut(current_block);
+                block.instructions.push(Instruction{t: InstructionType::Eq{
+                    dest: object_handle,
+                    lhs: lhs_obj,
+                    rhs: rhs_obj,
+                }});
+            },
+            FunctionAstType::VarName(ref s) => {
+                let src = self.get_name(s)?;
+                let block = self.block_mut(current_block);
+                block.instructions.push(Instruction{t: InstructionType::Copy{src, dst: object_handle}});
             },
             _ => return Err(Error::new("Invalid expression"))
         }
@@ -690,13 +749,15 @@ impl Graph {
             FunctionAstType::U32(_) => Err(Error::new("Unexpected int")),
             FunctionAstType::StringLiteral(_) => Err(Error::new("Unexpected string")),
             FunctionAstType::Add{..} => Err(Error::new("Unexpected add")),
+            FunctionAstType::DoubleEq{..} => Err(Error::new("Unexpected ==")),
+            FunctionAstType::VarName{..} => Err(Error::new("Unexpected var name")),
             FunctionAstType::Return(ref value) => {
                 let return_obj = self.new_object();
                 let after_eval_block = self.evaluate_and_store(&*value, current_block, return_obj)?;
                 self.block_mut(after_eval_block).jump = Some(Jump{t: JumpType::Return(return_obj)});
                 Ok(current_block)
             },
-            FunctionAstType::Let{ref ident, ref value} => {
+            FunctionAstType::Let{ref ident, ref t, ref value} => {
                 let var_obj = self.add_name(ident.clone())?;
                 self.evaluate_and_store(&*value, current_block, var_obj)
             },
@@ -786,6 +847,12 @@ impl Graph {
                             dst: move_arg_for(dest),
                         });
                     },
+                    InstructionType::Copy{src, dst} => {
+                        instructions.push(vm::Instruction{
+                            src: move_arg_for(src),
+                            dst: move_arg_for(dst),
+                        });
+                    },
                 }
             }
 
@@ -841,15 +908,15 @@ impl Graph {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-enum Constuctor {}
+pub(crate) enum Constuctor {}
 
 #[derive(Clone, PartialEq, Debug)]
-enum Type {
+pub(crate) enum Type {
     U32,
     Bool,
     String,
+    Struct(itemise::ItemPath),
     Compound(Constuctor, Vec<Type>),
-    Placeholder(ObjectHandle),
 }
 
 impl Type {
@@ -858,19 +925,14 @@ impl Type {
             Type::U32 => false,
             Type::Bool => false,
             Type::String => false,
+            Type::Struct(_) => false,
             Type::Compound(_, types) => types.iter().any(|t| t.depends_on(obj)),
-            Type::Placeholder(other) => obj == *other,
         }
     }
 
     fn do_substitutions(&mut self, graph: &Graph) {
         match self {
             Type::Compound(_, types) => types.into_iter().for_each(|t| t.do_substitutions(graph)),
-            Type::Placeholder(obj) => {
-                if let Some(ref sub) = graph.object(*obj).t {
-                    *self = sub.clone();
-                }
-            },
             _ => {},
         }
     }
@@ -880,15 +942,41 @@ impl Type {
             Type::U32 => 4,
             Type::Bool => 1,
             Type::String => 16,
+            Type::Struct(_) => panic!("Struct not supported"),
             Type::Compound(_, _) => panic!("Compound not supported"),
-            Type::Placeholder(_) => panic!("Remaining placeholde"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum TypeExpression {
+    Type(Type),
+    Placeholder(ObjectHandle),
+}
+
+impl TypeExpression {
+    fn depends_on(&self, obj: ObjectHandle) -> bool {
+        match self {
+            TypeExpression::Type(t) => t.depends_on(obj),
+            TypeExpression::Placeholder(other) => obj == *other,
+        }
+    }
+
+    fn do_substitutions(&mut self, graph: &Graph) {
+        match self {
+            TypeExpression::Type(t) => t.do_substitutions(graph),
+            TypeExpression::Placeholder(obj) => {
+                if let Some(ref sub) = graph.object(*obj).t {
+                    *self = TypeExpression::Type(sub.clone());
+                }
+            },
         }
     }
 }
 
 struct TypeEquation {
-    lhs: Type,
-    rhs: Type,
+    lhs: TypeExpression,
+    rhs: TypeExpression,
 }
 
 struct InferenceSystem {
@@ -896,7 +984,7 @@ struct InferenceSystem {
 }
 
 impl InferenceSystem {
-    fn add_eqn(&mut self, lhs: Type, rhs: Type) {
+    fn add_eqn(&mut self, lhs: TypeExpression, rhs: TypeExpression) {
         self.equations.push(TypeEquation{lhs, rhs});
     }
 
@@ -907,19 +995,22 @@ impl InferenceSystem {
             for inst in &block.instructions {
                 match inst.t {
                     InstructionType::Eq{dest, lhs, rhs} => {
-                        is.add_eqn(Type::Placeholder(dest), Type::Bool);
-                        is.add_eqn(Type::Placeholder(lhs), Type::Placeholder(rhs));
+                        is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::Bool));
+                        is.add_eqn(TypeExpression::Placeholder(lhs), TypeExpression::Placeholder(rhs));
                     },
                     InstructionType::StoreU32(dest, _) => {
-                        is.add_eqn(Type::Placeholder(dest), Type::U32);
+                        is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::U32));
                     },
                     InstructionType::StoreString(dest, _) => {
-                        is.add_eqn(Type::Placeholder(dest), Type::String);
+                        is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::String));
                     },
                     InstructionType::Add{dest, lhs, rhs} => {
-                        is.add_eqn(Type::Placeholder(lhs), Type::U32);
-                        is.add_eqn(Type::Placeholder(rhs), Type::U32);
-                        is.add_eqn(Type::Placeholder(dest), Type::U32);
+                        is.add_eqn(TypeExpression::Placeholder(lhs), TypeExpression::Type(Type::U32));
+                        is.add_eqn(TypeExpression::Placeholder(rhs), TypeExpression::Type(Type::U32));
+                        is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::U32));
+                    },
+                    InstructionType::Copy{src, dst} => {
+                        is.add_eqn(TypeExpression::Placeholder(src), TypeExpression::Placeholder(dst));
                     },
                 }
             }
@@ -929,10 +1020,10 @@ impl InferenceSystem {
                 Some(j) => {
                     match j.t {
                         JumpType::Return(val) => {
-                            is.add_eqn(Type::Placeholder(val), return_type.clone());
+                            is.add_eqn(TypeExpression::Placeholder(val), TypeExpression::Type(return_type.clone()));
                         },
                         JumpType::Cond{condition, ..} => {
-                            is.add_eqn(Type::Placeholder(condition), Type::Bool);
+                            is.add_eqn(TypeExpression::Placeholder(condition), TypeExpression::Type(Type::Bool));
                         },
                         JumpType::Uncond(..) => {},
                     }
@@ -964,13 +1055,13 @@ impl InferenceSystem {
         let mut to_remove = Vec::new();
         for (idx, eqn) in self.equations.iter().enumerate() {
             match (&eqn.lhs, &eqn.rhs) {
-                (Type::Compound(c, args), Type::Compound(c2, args2)) => {
+                (TypeExpression::Type(Type::Compound(c, args)), TypeExpression::Type(Type::Compound(c2, args2))) => {
                     if c == c2 && args.len() == args2.len() {
                         to_remove.push(idx);
                         for (a1, a2) in args.iter().zip(args2.iter()) {
                             new_equations.push(TypeEquation{
-                                lhs: a1.clone(),
-                                rhs: a2.clone(),
+                                lhs: TypeExpression::Type(a1.clone()),
+                                rhs: TypeExpression::Type(a2.clone()),
                             });
                         }
                     }
@@ -989,7 +1080,7 @@ impl InferenceSystem {
     fn check_conflict(&self) -> Result<()> {
         for eqn in &self.equations {
             match (&eqn.lhs, &eqn.rhs) {
-                (Type::Compound(c, args), Type::Compound(c2, args2)) => {
+                (TypeExpression::Type(Type::Compound(c, args)), TypeExpression::Type(Type::Compound(c2, args2))) => {
                     if c != c2 || args.len() != args2.len() {
                         return Err(Error::new("Type error"));
                     }
@@ -1003,7 +1094,7 @@ impl InferenceSystem {
     fn swap(&mut self) {
         for eqn in &mut self.equations {
             match (&eqn.lhs, &eqn.rhs) {
-                (_, Type::Placeholder(_)) => {
+                (_, TypeExpression::Placeholder(_)) => {
                     std::mem::swap(&mut eqn.lhs, &mut eqn.rhs);
                 },
                 _ => {}
@@ -1015,8 +1106,8 @@ impl InferenceSystem {
         let mut to_remove = Vec::new();
         for (idx, eqn) in self.equations.iter().enumerate() {
             match (&eqn.lhs, &eqn.rhs) {
-                (Type::Placeholder(_), Type::Placeholder(_)) => {},
-                (Type::Placeholder(obj), rhs) => {
+                (TypeExpression::Placeholder(_), TypeExpression::Placeholder(_)) => {},
+                (TypeExpression::Placeholder(obj), TypeExpression::Type(rhs)) => {
                     if !rhs.depends_on(*obj) {
                         to_remove.push(idx);
                         graph.object_mut(*obj).t = Some(rhs.clone());
@@ -1039,7 +1130,7 @@ impl InferenceSystem {
     fn check(&self) -> Result<()> {
         for eqn in &self.equations {
             match (&eqn.lhs, &eqn.rhs) {
-                (Type::Placeholder(obj), rhs) => {
+                (TypeExpression::Placeholder(obj), rhs) => {
                     if rhs.depends_on(*obj) {
                         return Err(Error::new("Self referential type"));
                     }
@@ -1057,7 +1148,7 @@ impl InferenceSystem {
 
         for eqn in &self.equations {
             match (&eqn.lhs, &eqn.rhs) {
-                (Type::Placeholder(_), Type::Placeholder(_)) => {},
+                (TypeExpression::Placeholder(_), TypeExpression::Placeholder(_)) => {},
                 _ => return true,
             }
         }
@@ -1089,11 +1180,41 @@ impl GetFunctionAst {
             Error::new("Could not find function")
         )?;
 
-        if item.t != ItemType::Fn {
-            return Err(Error::new("Not a function"));
+        match item.t {
+            ItemType::Fn(_) => parse_body(&item.tokens),
+            _ => return Err(Error::new("Not a function")),
+        }
+    }
+}
+
+#[derive(Hash, PartialEq, Clone)]
+struct GetFunctionReturnType {
+    path: ItemPath,
+}
+
+impl Query for GetFunctionReturnType {
+    type Output = Result<Type>;
+}
+
+impl GetFunctionReturnType {
+    pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
+        let global_items_arc = make_query!(&prog, GetGlobalItems).await;
+        if global_items_arc.is_err() {
+            return Err(global_items_arc.as_ref().as_ref().unwrap_err().clone());
         }
 
-        parse_body(&item.tokens)
+        let global_items = global_items_arc.as_ref().as_ref().unwrap();
+
+        let item = global_items.get(&self.path).ok_or(
+            Error::new("Could not find function")
+        )?;
+
+        match item.t {
+            ItemType::Fn(ref signature) => {
+                Ok(signature.return_type.as_ref().ok_or(Error::new("Function has unknown return type"))?.clone())
+            },
+            _ => return Err(Error::new("Not a function")),
+        }
     }
 }
 
@@ -1108,12 +1229,43 @@ impl Query for GetFunctionGraph {
 
 impl GetFunctionGraph {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
-        let function_ast_arc = make_query!(&prog, GetFunctionAst{path: self.path}).await;
+        let function_return_type_fut = make_query!(&prog, GetFunctionReturnType{path: self.path.clone()});
+        let function_ast_fut = make_query!(&prog, GetFunctionAst{path: self.path.clone()});
+
+        let (function_return_type_arc, function_ast_arc) = join!(function_return_type_fut, function_ast_fut);
+
+        if function_return_type_arc.is_err() {
+            return Err(function_return_type_arc.as_ref().as_ref().unwrap_err().clone());
+        }
+        let function_return_type = function_return_type_arc.as_ref().as_ref().unwrap();
+
         if function_ast_arc.is_err() {
             return Err(function_ast_arc.as_ref().as_ref().unwrap_err().clone());
         }
 
         let function_ast = function_ast_arc.as_ref().as_ref().unwrap();
-        Graph::from_function_ast(function_ast, Type::U32)
+        Graph::from_function_ast(function_ast, function_return_type.clone())
+    }
+}
+
+
+#[derive(Hash, PartialEq, Clone)]
+pub(crate) struct GetFunctionVmProgram {
+    pub(crate) path: ItemPath,
+}
+
+impl Query for GetFunctionVmProgram {
+    type Output = Result<vm::Program>;
+}
+
+impl GetFunctionVmProgram {
+    pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
+        let function_graph_arc = make_query!(&prog, GetFunctionGraph{path: self.path}).await;
+        if function_graph_arc.is_err() {
+            return Err(function_graph_arc.as_ref().as_ref().unwrap_err().clone());
+        }
+
+        let function_graph = function_graph_arc.as_ref().as_ref().unwrap();
+        function_graph.vm_program()
     }
 }

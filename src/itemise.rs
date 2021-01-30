@@ -2,6 +2,7 @@ use crate::{lex::{Token, TokenType, GetTokenStream}, make_query};
 use std::collections::HashMap;
 use crate::{Result, Error, Query, Program};
 use std::sync::Arc;
+use crate::function::Type;
 
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct ItemPath {
@@ -9,7 +10,7 @@ pub struct ItemPath {
 }
 
 impl ItemPath {
-    fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
         }
@@ -17,8 +18,14 @@ impl ItemPath {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FunctionSignature {
+    pub(crate) args: Vec<(String, Type)>,
+    pub(crate) return_type: Option<Type>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ItemType {
-    Fn,
+    Fn(FunctionSignature),
     Struct,
 }
 
@@ -28,74 +35,191 @@ pub(crate) struct Item {
     pub(crate) tokens: Vec<Token>,
 }
 
-pub(crate) fn itemise(token_stream: &Vec<Token>) -> Result<HashMap<ItemPath, Item>> {
+fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
     enum State {
-        Signature(Option<ItemType>, Option<ItemPath>),
-        Body(ItemType, ItemPath, usize),
+        Initial,
+        ArgStart,
+        ArgName(String),
+        ArgNameColon(String),
+        ArgEnd,
+        ArgsEnd,
+        TypeArrow,
+        End,
     }
 
-    let mut state = State::Signature(None, None);
-    let mut current_item_tokens = Vec::new();
-    let mut rtn = HashMap::new();
-    for token in token_stream {
-        let new_state = match state {
-            State::Body(item_type, item_path, mut brace_count) => {
-                match token.t {
-                    TokenType::OpenBrace => brace_count += 1,
-                    TokenType::CloseBrace => brace_count -= 1,
-                    _ => {current_item_tokens.push((*token).clone());}
-                }
+    let mut state = State::Initial;
+    let mut args = Vec::new();
+    let mut return_type = None;
 
-                if brace_count == 0 {
-                    rtn.insert(item_path, Item{t: item_type, tokens: current_item_tokens});
-                    current_item_tokens = Vec::new();
-                    State::Signature(None, None)
-                } else {
-                    State::Body(item_type, item_path, brace_count)
+    for token in tokens {
+        let new_state = match state {
+            State::Initial => {
+                match token.t {
+                    TokenType::OpenParen => State::ArgStart,
+                    _ => return Err(Error::new("Expected (")),
                 }
             },
-            State::Signature(item_type, item_path) => {
+            State::ArgStart => {
                 match token.t {
-                    TokenType::OpenBrace => {
-                        State::Body(
-                            item_type.ok_or(Error::new("Expected item type before {"))?,
-                            item_path.ok_or(Error::new("Expected item ident before {"))?,
-                            1
-                        )
-                    },
-                    TokenType::CloseBrace => {
-                        return Err(Error::new("Unexpected }"));
-                    },
-                    TokenType::Fn => {
-                        if item_type.is_some() {
-                            return Err(Error::new("Unexpected fn keyword"));
+                    TokenType::Ident(ref s) => State::ArgName(s.clone()),
+                    TokenType::CloseParen => {
+                        if args.len() == 0 {
+                            State::ArgsEnd
+                        } else {
+                            return Err(Error::new("Expected argument name"));
                         }
-
-                        State::Signature(Some(ItemType::Fn), None)
-                    },
-                    TokenType::Struct => {
-                        if item_type.is_some() {
-                            return Err(Error::new("Unexpected struct keyword"));
-                        }
-
-                        State::Signature(Some(ItemType::Struct), None)
-                    },
-                    TokenType::Ident(ref name) => {
-                        if item_type.is_none() {
-                            return Err(Error::new("Expected item type before item identifier"));
-                        }
-
-                        State::Signature(item_type, Some(ItemPath{name: (*name).clone()}))
-                    },
-                    _ => {
-                        return Err(Error::new("Unexpected token in item signature"));
                     }
+                    _ => return Err(Error::new("Expected argument name")),
                 }
+            },
+            State::ArgName(s) => {
+                match token.t {
+                    TokenType::Colon => State::ArgNameColon(s),
+                    _ => return Err(Error::new("Expected colon")),
+                }
+            },
+            State::ArgNameColon(s) => {
+                match token.t {
+                    TokenType::Ident(ref t) => {
+                        args.push((s, Type::Struct(ItemPath{name: t.clone()})));
+                        State::ArgEnd
+                    },
+                    TokenType::U32 => {
+                        args.push((s, Type::U32));
+                        State::ArgsEnd
+                    },
+                    _ => return Err(Error::new("Expected type identifier")),
+                }
+            },
+            State::ArgEnd => {
+                match token.t {
+                    TokenType::Comma => State::ArgStart,
+                    TokenType::CloseParen => State::ArgsEnd,
+                    _ => return Err(Error::new("Expected , or )")),
+                }
+            },
+            State::ArgsEnd => {
+                match token.t {
+                    TokenType::ThinArrow => State::TypeArrow,
+                    _ => return Err(Error::new("Expected ->")),
+                }
+            },
+            State::TypeArrow => {
+                match token.t {
+                    TokenType::Ident(ref s) => {
+                        return_type = Some(Type::Struct(ItemPath{name: s.clone()}));
+                        State::End
+                    },
+                    TokenType::U32 => {
+                        return_type = Some(Type::U32);
+                        State::End
+                    },
+                    _ => return Err(Error::new("Expected return type name"))
+                }
+            },
+            State::End => {
+                return Err(Error::new("Unexpected token"));
             }
         };
         state = new_state;
     }
-    Ok(rtn)
+
+    match state {
+        State::End | State::ArgsEnd => {
+            Ok(FunctionSignature {
+                args,
+                return_type,
+            })
+        },
+        _ => Err(Error::new("Unexpected end of function signature"))
+    }
+
+}
+
+pub(crate) fn itemise(token_stream: &Vec<Token>) -> Result<HashMap<ItemPath, Item>> {
+    enum State {
+        NoItem,
+        StructNoPath,
+        Struct(ItemPath),
+
+        FnNoPath,
+        FnPartialSignature{
+            path: ItemPath,
+            first_token: usize,
+        },
+
+        Body(ItemType, ItemPath, usize),
+    }
+
+    let mut state = State::NoItem;
+    let mut current_item_tokens = Vec::new();
+    let mut rtn = HashMap::new();
+    for (idx, token) in token_stream.iter().enumerate() {
+        let new_state = match state {
+            State::NoItem => {
+                match token.t {
+                    TokenType::Struct => State::StructNoPath,
+                    TokenType::Fn => State::FnNoPath,
+                    _ => return Err(Error::new("Expected struct or fn")),
+                }
+            },
+
+            State::StructNoPath => {
+                match token.t {
+                    TokenType::Ident(ref s) => State::Struct(ItemPath{name: s.clone()}),
+                    _ => return Err(Error::new("Expected struct name")),
+                }
+            },
+            State::Struct(path) => {
+                match token.t {
+                    TokenType::OpenBrace => State::Body(ItemType::Struct, path, 1),
+                    _ => return Err(Error::new("Expected {")),
+                }
+            },
+
+            State::FnNoPath => {
+                match token.t {
+                    TokenType::Ident(ref s) => State::FnPartialSignature{
+                        path: ItemPath{name: s.clone()},
+                        first_token: idx + 1
+                    },
+                    _ => return Err(Error::new("Expected fn name")),
+                }
+            },
+            State::FnPartialSignature{path, first_token} => {
+                match token.t {
+                    TokenType::OpenBrace => State::Body(
+                        ItemType::Fn(parse_fn_signature(&token_stream[first_token..idx])?),
+                        path,
+                        1
+                    ),
+                    _ => State::FnPartialSignature{path, first_token},
+                }
+            },
+            State::Body(item_type, path, mut brace_depth) => {
+                match token.t {
+                    TokenType::OpenBrace => brace_depth += 1,
+                    TokenType::CloseBrace => brace_depth -= 1,
+                    _ => {},
+                };
+
+                if brace_depth == 0 {
+                    rtn.insert(path, Item{t: item_type, tokens: current_item_tokens});
+                    current_item_tokens = Vec::new();
+                    State::NoItem
+                } else {
+                    current_item_tokens.push(token.clone());
+                    State::Body(item_type, path, brace_depth)
+                }
+            },
+        };
+        state = new_state;
+    }
+
+    match state {
+        State::NoItem => Ok(rtn),
+        _ => {Err(Error::new("Unexpected end of file"))}
+    }
 }
 
 #[derive(Hash, PartialEq, Clone)]
@@ -126,12 +250,12 @@ mod test {
 
     #[test]
     fn test_items() {
-        let token_stream = lex("fn a {}\nstruct s {1}").unwrap();
+        let token_stream = lex("fn a() {}\nstruct s {1}").unwrap();
         let items = itemise(&token_stream);
         assert_eq!(
             items.unwrap(),
             hashmap!{
-                ItemPath::new("a") => Item{t: ItemType::Fn, tokens: vec![]},
+                ItemPath::new("a") => Item{t: ItemType::Fn(FunctionSignature{args: Vec::new(), return_type: None}), tokens: vec![]},
                 ItemPath::new("s") => Item{t: ItemType::Struct, tokens: vec![Token{t: TokenType::Int("1".to_string())}]}
             }
         );
