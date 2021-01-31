@@ -124,7 +124,7 @@ impl Vm {
                 self.instruction_idx += 1;
                 continue;
             }
-
+            
             let inst = &program.instructions[self.instruction_idx as usize];
 
             let src = match inst.src {

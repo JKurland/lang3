@@ -313,4 +313,21 @@ mod tests {
             }"#
         ), Ok(2));
     }
+
+    #[test]
+    fn end_to_end10() {
+        assert_eq!(run_main(
+            r#"
+            fn main() -> u32 {
+                let i = 2;
+                loop {
+                    i = i + 1;
+                    if i == 10 {
+                        break;
+                    }
+                }
+                return i;
+            }"#
+        ), Ok(10));
+    }
 }

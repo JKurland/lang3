@@ -9,6 +9,7 @@ use futures::join;
 enum FunctionItemType {
     Loop,
     If,
+    Break,
     Expr,
     Scope,
     Return,
@@ -57,6 +58,7 @@ enum FunctionAstType {
         lhs: Box<FunctionAst>,
         rhs: Box<FunctionAst>,
     },
+    Break,
 }
 #[derive(Debug)]
 pub(crate) struct FunctionAst {
@@ -71,6 +73,7 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
         LoopSignature,
         Expr,
         IfBody,
+        Break,
         Return,
         LetBeforeEq,
         Let,
@@ -95,6 +98,7 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
                     TokenType::OpenBrace => State::Body(FunctionItemType::Scope),
                     TokenType::Return => State::Return,
                     TokenType::Let => State::LetBeforeEq,
+                    TokenType::Break => State::Break,
                     TokenType::Ident(_) => {
                         if let Some(next) = token_stream.get(idx + 1) {
                             match next.t {
@@ -138,6 +142,12 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
                         }
                     },
                     _ => state,
+                }
+            },
+            State::Break => {
+                match token.t {
+                    TokenType::SemiColon => State::FinishedItem(FunctionItemType::Break),
+                    _ => return Err(Error::new("Expected ;")),
                 }
             },
             State::Skip(left_to_skip, outer_state) => {
@@ -242,6 +252,7 @@ fn parse_item(item: &FunctionItem) -> Result<FunctionAst> {
     match item.t {
         FunctionItemType::Expr => parse_expr(item.tokens),
         FunctionItemType::If => parse_if(item.tokens),
+        FunctionItemType::Break => Ok(FunctionAst{t: FunctionAstType::Break}),
         FunctionItemType::Loop => parse_loop(item.tokens),
         FunctionItemType::Scope => parse_scope(item.tokens),
         FunctionItemType::Return => parse_return(item.tokens),
@@ -719,8 +730,13 @@ impl Graph {
 
                 let after_block = self.new_block();
 
-                self.block_mut(final_true_block).jump = Some(Jump{t: JumpType::Uncond(after_block)});
-                self.block_mut(final_false_block).jump = Some(Jump{t: JumpType::Uncond(after_block)});
+                if self.block(final_true_block).jump.is_none() {
+                    self.block_mut(final_true_block).jump = Some(Jump{t: JumpType::Uncond(after_block)});
+                }
+
+                if self.block(final_false_block).jump.is_none() {
+                    self.block_mut(final_false_block).jump = Some(Jump{t: JumpType::Uncond(after_block)});
+                }
                 Ok(after_block)
             },
             FunctionAstType::Loop{ref body} => {
@@ -736,6 +752,12 @@ impl Graph {
                 self.block_mut(final_block).jump = Some(Jump{t: JumpType::Uncond(body_block)});
 
                 Ok(after_block)
+            },
+            FunctionAstType::Break => {
+                self.block_mut(current_block).jump = Some(Jump{
+                    t: JumpType::Uncond(labels.break_.ok_or(Error::new("Break must be inside loop"))?)
+                });
+                Ok(current_block)
             },
             FunctionAstType::Scope{ref items} => {
                 let mut block_handle = current_block;

@@ -10,6 +10,8 @@ edition = "2018"
 futures = {version = "0.3.8", features = ["thread-pool"]}
 chashmap = "2.2.2"
 maplit = "1.0.2"
+libffi = "1.0.0"
+libloading = "0.6"
 
 
 [dev-dependencies]
