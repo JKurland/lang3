@@ -1,9 +1,10 @@
-use crate::itemise::{self, GetGlobalItems, ItemPath, ItemType};
+use crate::itemise::{self, GetGlobalItems, ItemPath, ItemType, Item};
 use crate::lex::{Token, TokenType};
 use crate::{Result, Error, Query, Program, make_query};
 use crate::vm;
 use std::{collections::HashMap, sync::Arc};
-use futures::join;
+use futures::{join, future::join_all};
+use itemise::FunctionSignature;
 
 #[derive(Debug)]
 enum FunctionItemType {
@@ -58,11 +59,18 @@ enum FunctionAstType {
         lhs: Box<FunctionAst>,
         rhs: Box<FunctionAst>,
     },
+    ParenGroup {
+        lhs: Option<Box<FunctionAst>>,
+        inside: Option<Box<FunctionAst>>,
+        rhs: Option<Box<FunctionAst>>,
+    },
     Break,
 }
+
 #[derive(Debug)]
 pub(crate) struct FunctionAst {
     t: FunctionAstType,
+    
 }
 
 fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
@@ -374,16 +382,20 @@ fn parse_if(token_stream: &[Token]) -> Result<FunctionAst> {
     }})
 }
 
+#[derive(Debug)]
 enum OperatorType {
     Add,
     DoubleEq,
+    ParenGroup(usize),
 }
 
+#[derive(Debug)]
 struct Operator {
     t: OperatorType,
     idx: usize,
-    priority: (i32, i32),
+    priority: i32,
 }
+
 
 fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: usize, right_end: usize) -> Result<FunctionAst> {
     if let Some((root_op_idx, root_op)) = operators.iter().enumerate().min_by_key(|o| o.1.priority) {
@@ -399,7 +411,31 @@ fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: us
                     lhs: Box::new(parse_expr_inner(&operators[..root_op_idx], token_stream, left_end, root_op.idx - 1)?),
                     rhs: Box::new(parse_expr_inner(&operators[root_op_idx + 1..], token_stream, root_op.idx + 1, right_end)?),
                 }})
-            }
+            },
+            OperatorType::ParenGroup(open_idx) => {
+                // By this point we've already handled all the operators where one of the operands can be a paren group
+                // since all their evalutation priorities are lower than that of ParenGroup. That means lhs and rhs must
+                // both be complete expressions since otherwise this ParenGroup would be one of their operands.
+                let lhs = if left_end == open_idx {
+                    None
+                } else {
+                    Some(Box::new(parse_expr_inner(&operators[..root_op_idx], token_stream, left_end, open_idx - 1)?))
+                };
+
+                let rhs = if right_end == root_op.idx {
+                    None
+                } else {
+                    Some(Box::new(parse_expr_inner(&operators[root_op_idx + 1..], token_stream, root_op.idx + 1, right_end)?))
+                };
+
+                let inside = if open_idx + 1 == root_op.idx {
+                    None
+                } else {
+                    Some(Box::new(parse_expr(&token_stream[open_idx+1..root_op.idx])?))
+                };
+
+                Ok(FunctionAst{t: FunctionAstType::ParenGroup{lhs, rhs, inside}})
+            },
         }
     } else {
         if left_end != right_end {
@@ -426,20 +462,57 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
     // find the operators in the expression
     let mut operators = Vec::new();
     operators.reserve(expr_body.len());
+
+    enum State {
+        TopLevel,
+        InParens(usize),
+    }
+
+    let mut state = State::TopLevel;
+
     for (idx, token) in expr_body.iter().enumerate() {
-        match token.t {
-            TokenType::Plus => operators.push(Operator{
-                t: OperatorType::Add,
-                idx,
-                priority: (0, 10),
-            }),
-            TokenType::DoubleEq => operators.push(Operator{
-                t: OperatorType::DoubleEq,
-                idx,
-                priority: (0, 0),
-            }),
-            _ => {},
-        }
+        let new_state = match state {
+            State::TopLevel => {
+                match token.t {
+                    TokenType::Plus => {
+                        operators.push(Operator{
+                            t: OperatorType::Add,
+                            idx,
+                            priority: 10,
+                        });
+                        state
+                    },
+                    TokenType::DoubleEq => {
+                        operators.push(Operator{
+                            t: OperatorType::DoubleEq,
+                            idx,
+                            priority: 0,
+                        });
+                        state
+                    },
+                    TokenType::OpenParen => State::InParens(idx),
+                    _ => state,
+                }
+            },
+            State::InParens(open_idx) => {
+                match token.t {
+                    TokenType::CloseParen => {
+                        operators.push(Operator{
+                            t: OperatorType::ParenGroup(open_idx),
+                            idx,
+                            priority: 100,
+                        });
+                        State::TopLevel
+                    },
+                    _ => state,
+                }
+            },
+        };
+        state = new_state;
+    }
+
+    if let State::InParens(_) = state {
+        return Err(Error::new("Expected )"));
     }
 
     // fill in the lhs and rhs of each operator
@@ -470,6 +543,11 @@ enum InstructionType {
     Copy{
         src: ObjectHandle,
         dst: ObjectHandle,
+    },
+    Call{
+        callee: ItemPath,
+        signature: FunctionSignature,
+        args: Vec<ObjectHandle>,
     },
 }
 
@@ -634,9 +712,9 @@ impl Graph {
         ObjectHandle(self.objects.len() - 1)
     }
 
-    pub(crate) fn from_function_ast(ast: &FunctionAst, return_type: Type) -> Result<Self> {
+    pub(crate) fn from_function_ast(ast: &FunctionAst, return_type: Type, global_items: &HashMap<ItemPath, Item>) -> Result<Self> {
         let mut graph = Self::new();
-        graph.add_flow(ast, graph.entry_block(), &Labels{break_: None})?;
+        graph.add_flow(ast, graph.entry_block(), &Labels{break_: None}, global_items)?;
 
         InferenceSystem::add_types(&mut graph, return_type)?;
         for handle in graph.objects() {
@@ -697,13 +775,9 @@ impl Graph {
         Ok(current_block)
     } 
 
-    fn add_flow(&mut self, ast: &FunctionAst, current_block: BlockHandle, labels: &Labels) -> Result<BlockHandle> {
+    fn add_flow(&mut self, ast: &FunctionAst, current_block: BlockHandle, labels: &Labels, global_items: &HashMap<ItemPath, Item>) -> Result<BlockHandle> {
         match ast.t {
-            FunctionAstType::IfStatement{
-                ref condition,
-                ref true_,
-                ref false_
-            } => {
+            FunctionAstType::IfStatement{ref condition, ref true_, ref false_ } => {
                 let cond_obj_handle = self.new_object();
                 let after_eval_block = self.evaluate_and_store(&*condition, current_block, cond_obj_handle)?;
                 
@@ -719,13 +793,15 @@ impl Graph {
                 let final_true_block = self.add_flow(
                     &*true_,
                     true_block,
-                    labels
+                    labels,
+                    global_items,
                 )?;
 
                 let final_false_block = self.add_flow(
                     &*false_,
                     false_block,
                     labels,
+                    global_items,
                 )?;
 
                 let after_block = self.new_block();
@@ -748,7 +824,7 @@ impl Graph {
                 let mut loop_labels = labels.clone();
                 loop_labels.break_ = Some(after_block);
 
-                let final_block = self.add_flow(&*body, body_block, &loop_labels)?;
+                let final_block = self.add_flow(&*body, body_block, &loop_labels, global_items)?;
                 self.block_mut(final_block).jump = Some(Jump{t: JumpType::Uncond(body_block)});
 
                 Ok(after_block)
@@ -763,10 +839,49 @@ impl Graph {
                 let mut block_handle = current_block;
                 self.push_scope();
                 for item in items {
-                    block_handle = self.add_flow(item, block_handle, labels)?;
+                    block_handle = self.add_flow(item, block_handle, labels, global_items)?;
                 }
                 self.pop_scope();
                 Ok(block_handle)
+            },
+            FunctionAstType::ParenGroup{ref lhs, ref inside, ref rhs} => {
+                if rhs.is_some() {
+                    return Err(Error::new("Paren group not supported as prefix operator"));
+                }
+
+                
+                match lhs {
+                    None => {
+                        let val = self.new_object();
+                        match inside {
+                            None => Err(Error::new("Expected something inside parens")),
+                            Some(inside) => self.evaluate_and_store(&**inside, current_block, val),
+                        }
+                    },
+                    Some(lhs) => {
+                        let callee_path;
+                        if let FunctionAstType::VarName(ref callee_name) = lhs.t {
+                            callee_path = ItemPath::new(callee_name);
+                        } else {
+                            return Err(Error::new("Expected name before parens"))
+                        }
+                        
+                        let callee_item = global_items.get(&callee_path).ok_or(Error::new("Unknown item"))?;
+
+                        if let ItemType::Fn(ref signature) = callee_item.t {
+                            self.block_mut(current_block).instructions.push(Instruction{
+                                t: InstructionType::Call{
+                                    callee: callee_path,
+                                    signature: signature.clone(),
+                                    args: vec![]
+                                }
+                            });
+                            Ok(current_block)
+                        } else {
+                            Err(Error::new("Can only call functions"))
+                        }
+                    },
+                }
             },
             FunctionAstType::U32(_) => Err(Error::new("Unexpected int")),
             FunctionAstType::StringLiteral(_) => Err(Error::new("Unexpected string")),
@@ -779,7 +894,7 @@ impl Graph {
                 self.block_mut(after_eval_block).jump = Some(Jump{t: JumpType::Return(return_obj)});
                 Ok(current_block)
             },
-            FunctionAstType::Let{ref ident, ref t, ref value} => {
+            FunctionAstType::Let{ref ident, t: _, ref value} => {
                 let var_obj = self.add_name(ident.clone())?;
                 self.evaluate_and_store(&*value, current_block, var_obj)
             },
@@ -791,8 +906,8 @@ impl Graph {
     }
 
 
-    pub(crate) fn vm_program(&self) -> Result<vm::Program> {
-        let mut prog = vm::Program::new();
+    pub(crate) fn vm_program(&self, prog: &mut vm::Program, halt_on_return: bool) -> Result<Vec<ItemPath>> {
+        let mut dependencies = Vec::new();
         let stack_offsets: Vec<usize> = self.objects.iter()
             .map(|o| o.t.as_ref().unwrap().size())
             .scan(0, |total, size| {*total += size; Some(*total - size)})
@@ -875,6 +990,23 @@ impl Graph {
                             dst: move_arg_for(dst),
                         });
                     },
+                    InstructionType::Call{ref callee, ref signature, ref args} => {
+                        if !args.is_empty() {
+                            return Err(Error::new("function arguments not supported yet"));
+                        }
+
+                        dependencies.push(callee.clone());
+
+                        instructions.push(vm::Instruction{
+                            src: vm::MoveArg::InstructionIdx,
+                            dst: vm::MoveArg::ReturnAddressStack,
+                        });
+
+                        instructions.push(vm::Instruction{
+                            src: vm::MoveArg::FunctionStartIdx(callee.clone()),
+                            dst: vm::MoveArg::InstructionIdx,
+                        });
+                    },
                 }
             }
 
@@ -895,12 +1027,20 @@ impl Graph {
                 JumpType::Return(obj) => {
                     instructions.push(vm::Instruction{
                         src: move_arg_for(obj),
-                        dst: vm::MoveArg::ProgramReturnValue,
+                        dst: vm::MoveArg::ReturnValue,
                     });
-                    instructions.push(vm::Instruction{
-                        src: vm::MoveArg::Byte(0),
-                        dst: vm::MoveArg::Halt,
-                    });
+
+                    if halt_on_return {
+                        instructions.push(vm::Instruction{
+                            src: vm::MoveArg::Byte(1),
+                            dst: vm::MoveArg::Halt,
+                        });
+                    } else {
+                        instructions.push(vm::Instruction{
+                            src: vm::MoveArg::ReturnAddressStack,
+                            dst: vm::MoveArg::InstructionIdx,
+                        });
+                    }
                 },
                 JumpType::Cond{condition, true_, false_} => {
                     instructions.push(vm::Instruction{
@@ -925,7 +1065,7 @@ impl Graph {
             }
         }
         prog.instructions.extend(blocks.into_iter().flatten());
-        Ok(prog)
+        Ok(dependencies)
     }
 }
 
@@ -1033,6 +1173,11 @@ impl InferenceSystem {
                     },
                     InstructionType::Copy{src, dst} => {
                         is.add_eqn(TypeExpression::Placeholder(src), TypeExpression::Placeholder(dst));
+                    },
+                    InstructionType::Call{callee: _, ref signature, ref args} => {
+                        for (arg, sig) in args.iter().zip(&signature.args) {
+                            is.add_eqn(TypeExpression::Placeholder(*arg), TypeExpression::Type(sig.1.clone()));
+                        }
                     },
                 }
             }
@@ -1253,8 +1398,9 @@ impl GetFunctionGraph {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
         let function_return_type_fut = make_query!(&prog, GetFunctionReturnType{path: self.path.clone()});
         let function_ast_fut = make_query!(&prog, GetFunctionAst{path: self.path.clone()});
+        let global_items_fut = make_query!(&prog, GetGlobalItems);
 
-        let (function_return_type_arc, function_ast_arc) = join!(function_return_type_fut, function_ast_fut);
+        let (function_return_type_arc, function_ast_arc, global_items_arc) = join!(function_return_type_fut, function_ast_fut, global_items_fut);
 
         if function_return_type_arc.is_err() {
             return Err(function_return_type_arc.as_ref().as_ref().unwrap_err().clone());
@@ -1265,8 +1411,13 @@ impl GetFunctionGraph {
             return Err(function_ast_arc.as_ref().as_ref().unwrap_err().clone());
         }
 
+        if global_items_arc.is_err() {
+            return Err(global_items_arc.as_ref().as_ref().unwrap_err().clone());
+        }
+        let global_items = global_items_arc.as_ref().as_ref().unwrap();
+
         let function_ast = function_ast_arc.as_ref().as_ref().unwrap();
-        Graph::from_function_ast(function_ast, function_return_type.clone())
+        Graph::from_function_ast(function_ast, function_return_type.clone(), global_items)
     }
 }
 
@@ -1282,12 +1433,31 @@ impl Query for GetFunctionVmProgram {
 
 impl GetFunctionVmProgram {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
-        let function_graph_arc = make_query!(&prog, GetFunctionGraph{path: self.path}).await;
-        if function_graph_arc.is_err() {
-            return Err(function_graph_arc.as_ref().as_ref().unwrap_err().clone());
-        }
+        let mut vm_prog = vm::Program::new();    
+        let mut deps = vec![self.path];
+        let mut halt_on_return = true;
 
-        let function_graph = function_graph_arc.as_ref().as_ref().unwrap();
-        function_graph.vm_program()
+        while !deps.is_empty() {
+            deps.retain(|path| !vm_prog.functions.contains_key(path));
+
+            let graph_futures = 
+                deps.iter()
+                .map(|path| make_query!(&prog, GetFunctionGraph{path: path.clone()}));
+
+            let graph_arcs = join_all(graph_futures).await;
+
+            let mut new_deps = Vec::new();
+            for (arc, path) in graph_arcs.iter().zip(&deps) {
+                if arc.is_err() {
+                    return Err(arc.as_ref().as_ref().unwrap_err().clone());
+                }
+
+                vm_prog.functions.insert(path.clone(), vm_prog.instructions.len() as u64);
+                new_deps.extend(arc.as_ref().as_ref().unwrap().vm_program(&mut vm_prog, halt_on_return)?);
+                halt_on_return = false;
+            }
+            deps = new_deps;
+        }
+        Ok(vm_prog)
     }
 }

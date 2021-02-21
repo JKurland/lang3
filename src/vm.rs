@@ -1,3 +1,6 @@
+use crate::itemise::ItemPath;
+use std::collections::HashMap;
+
 
 #[derive(Debug)]
 pub(crate) enum MoveArg {
@@ -35,7 +38,10 @@ pub(crate) enum MoveArg {
 
     SkipNext,
 
-    ProgramReturnValue,
+    FunctionStartIdx(ItemPath),
+    ReturnAddressStack,
+
+    ReturnValue,
     Halt,
 }
 
@@ -49,6 +55,7 @@ pub(crate) struct Instruction {
 pub(crate) struct Program {
     pub(crate) instructions: Vec<Instruction>,
     pub(crate) constants: Vec<u8>,
+    pub(crate) functions: HashMap<ItemPath, u64>,
 }
 
 impl Program {
@@ -56,6 +63,7 @@ impl Program {
         Self {
             instructions: Vec::new(),
             constants: Vec::new(),
+            functions: HashMap::new(),
         }
     }
 }
@@ -77,7 +85,9 @@ pub(crate) struct Vm {
 
     skip_next: u64,
 
-    program_return_value: u64,
+    return_value: u64,
+
+    return_address_stack: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -113,7 +123,9 @@ impl Vm {
 
             skip_next: 0,
 
-            program_return_value: 0,
+            return_value: 0,
+
+            return_address_stack: vec![],
         }
     }
 
@@ -156,7 +168,10 @@ impl Vm {
 
                 MoveArg::SkipNext => DataSource::Word(self.skip_next),
 
-                MoveArg::ProgramReturnValue => DataSource::Word(self.program_return_value),
+                MoveArg::FunctionStartIdx(ref path) => DataSource::Word(*program.functions.get(path).unwrap()),
+                MoveArg::ReturnAddressStack => DataSource::Word(self.return_address_stack.pop().unwrap() + 2),
+
+                MoveArg::ReturnValue => DataSource::Word(self.return_value),
                 MoveArg::Halt => DataSource::Byte(0),
             };
 
@@ -168,6 +183,7 @@ impl Vm {
                 MoveArg::Word(_) => panic!("Invalid Dest"),
                 MoveArg::Constant{..} => panic!("Invalid Dest"),
                 MoveArg::AddressOfConstant{..} => panic!("Invalid Dest"),
+                MoveArg::FunctionStartIdx(_) => panic!("Invalid Dest"),
 
                 MoveArg::Stack{offset, len} => DataSink::Slice(&mut self.stack[(self.stack_idx as i64 + offset) as usize], len as usize),
                 MoveArg::InstructionIdx => DataSink::Register(&mut self.instruction_idx),
@@ -189,7 +205,12 @@ impl Vm {
 
                 MoveArg::SkipNext => DataSink::Register(&mut self.skip_next),
 
-                MoveArg::ProgramReturnValue => DataSink::Register(&mut self.program_return_value),
+                MoveArg::ReturnAddressStack => {
+                    self.return_address_stack.push(0);
+                    DataSink::Register(self.return_address_stack.last_mut().unwrap())
+                },
+
+                MoveArg::ReturnValue => DataSink::Register(&mut self.return_value),
                 MoveArg::Halt => DataSink::Halt,
             };
 
@@ -219,7 +240,7 @@ impl Vm {
                 },
                 (DataSource::Slice(s, len), DataSink::Slice(d, _)) => unsafe {s.copy_to_nonoverlapping(d, len)},
 
-                (_, DataSink::Halt) => return self.program_return_value,
+                (_, DataSink::Halt) => return self.return_value,
             }
         }
     }

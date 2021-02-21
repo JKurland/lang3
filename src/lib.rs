@@ -152,10 +152,12 @@ pub trait Query: Send + Sync + Clone + Hash + PartialEq + 'static {
 #[macro_export]
 macro_rules! make_query {
     ($prog:expr, $query:expr) => { 
-        async {
-            let prog: &Arc<$crate::Program> = $prog;
+        {
+            let prog: Arc<$crate::Program> = ($prog).clone();
             let query = $query;
-            prog.run_query(query.clone(), query.make(prog.clone())).await
+            async move {
+                prog.run_query(query.clone(), query.make(prog.clone())).await
+            }
         }
     };
 }
@@ -181,22 +183,6 @@ mod tests {
 
         let mut vm = vm::Vm::new(8092);
         Ok(vm.run(&program) as u32)
-    }
-
-    fn run(src: &str) -> Result<u32> {
-        let tokens = lex::lex(src)?;
-        let ast = function::parse_body(&tokens)?;
-        let graph = function::Graph::from_function_ast(&ast, function::Type::U32)?;
-        let program = graph.vm_program()?;
-        let mut vm = vm::Vm::new(8092);
-        Ok(vm.run(&program) as u32)
-    }
-
-    #[test]
-    fn function_body() {
-        assert_eq!(run("return 3;"), Ok(3));
-        assert_eq!(run("return 3 + 2;"), Ok(5));
-        assert_eq!(run("return 3 + 2 + 5 + 10;"), Ok(20));
     }
 
     #[test]
@@ -327,6 +313,21 @@ mod tests {
                     }
                 }
                 return i;
+            }"#
+        ), Ok(10));
+    }
+
+    #[test]
+    fn two_funcs() {
+        assert_eq!(run_main(
+            r#"
+            fn other() -> u32 {
+                return 2;
+            }
+
+            fn main() -> u32 {
+                other();
+                return 10;
             }"#
         ), Ok(10));
     }
