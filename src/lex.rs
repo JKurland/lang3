@@ -29,6 +29,7 @@ pub enum TokenType {
     CloseParen,
     Equal,
     Plus,
+    EOF,
 }
 
 #[derive(Debug, PartialEq, Clone)]

@@ -16,6 +16,7 @@ pub(crate) mod lex;
 pub(crate) mod itemise;
 pub(crate) mod function;
 pub(crate) mod vm;
+pub(crate) mod storage;
 
 
 #[derive(Debug, PartialEq, Clone)]
@@ -166,7 +167,7 @@ macro_rules! make_query {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use function::GetFunctionVmProgram;
+    use vm::GetFunctionVmProgram;
     use itemise::ItemPath;
 
 
@@ -186,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end1() {
+    fn end_to_end01() {
         assert_eq!(run_main(
             r#"
             fn main() -> u32 {
@@ -330,5 +331,46 @@ mod tests {
                 return 10;
             }"#
         ), Ok(10));
+    }
+
+    #[test]
+    fn test_if_return() {
+        assert_eq!(run_main(
+            r#"
+            fn main() -> u32{
+                if 2 == 2 {
+                    63
+                } else {
+                    return 3;
+                }
+            }"#
+        ), Ok(63));
+    }
+
+    #[test]
+    fn test_function_call() {
+        assert_eq!(run_main(r#"
+            fn other() -> u32 {
+                return 2;
+            }
+
+            fn main() -> u32 {
+                let a = other();
+                return a + 2;
+            }"#
+        ), Ok(4));
+    }
+
+    #[test]
+    fn test_function_temp() {
+        assert_eq!(run_main(r#"
+            fn other() -> u32 {
+                return 2;
+            }
+
+            fn main() -> u32 {
+                return other() + 3;
+            }"#
+        ), Ok(5));
     }
 }

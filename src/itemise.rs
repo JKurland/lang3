@@ -20,7 +20,7 @@ impl ItemPath {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FunctionSignature {
     pub(crate) args: Vec<(String, Type)>,
-    pub(crate) return_type: Option<Type>,
+    pub(crate) return_type: Type,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,7 +128,7 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
         State::End | State::ArgsEnd => {
             Ok(FunctionSignature {
                 args,
-                return_type,
+                return_type: return_type.unwrap_or(Type::Null),
             })
         },
         _ => Err(Error::new("Unexpected end of function signature"))
@@ -255,7 +255,7 @@ mod test {
         assert_eq!(
             items.unwrap(),
             hashmap!{
-                ItemPath::new("a") => Item{t: ItemType::Fn(FunctionSignature{args: Vec::new(), return_type: None}), tokens: vec![]},
+                ItemPath::new("a") => Item{t: ItemType::Fn(FunctionSignature{args: Vec::new(), return_type: Type::Null}), tokens: vec![]},
                 ItemPath::new("s") => Item{t: ItemType::Struct, tokens: vec![Token{t: TokenType::Int("1".to_string())}]}
             }
         );
