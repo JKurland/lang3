@@ -57,6 +57,30 @@ pub(crate) enum MoveArg {
     None,
 }
 
+fn size(t: &Type) -> usize {
+    match t {
+        Type::U32 => 4,
+        Type::Bool => 1,
+        Type::String => 16,
+        Type::Never => 0,
+        Type::Null => 0,
+        Type::Struct(_) => panic!("Struct not supported"),
+        Type::Compound(_, _) => panic!("Compound not supported"),
+    }
+}
+
+fn align(t: &Type) -> usize {
+    match t {
+        Type::U32 => std::mem::align_of::<u32>(),
+        Type::Bool => 1,
+        Type::String => 16,
+        Type::Never => 1,
+        Type::Null => 1,
+        Type::Struct(_) => panic!("Struct not supported align"),
+        Type::Compound(_, _) => panic!("Compound not supported align"),
+    }
+}
+
 fn align_up_to(x: usize, align: usize) -> usize {
     x + ((align - (x % align)) % align)
 }
@@ -64,9 +88,9 @@ fn align_up_to(x: usize, align: usize) -> usize {
 fn offsets<'a, T: Iterator<Item = &'a Type> + 'a>(types: T, initial: usize) -> impl Iterator<Item = usize> + 'a {
     let mut total = initial;
     types.map(move |t| {
-        total = align_up_to(total, t.align());
+        total = align_up_to(total, align(t));
         let ret = total;
-        total += t.size();
+        total += size(t);
         ret
     })
 }
@@ -396,7 +420,7 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
     let move_arg_for = |o: function::ObjectHandle| -> MoveArg {
         MoveArg::Stack{
             offset: *stack_offsets.get(&o).unwrap() as i64,
-            len: graph.object(o).t.as_ref().unwrap().size() as u64
+            len: size(graph.object(o).t.as_ref().unwrap()) as u64
         }
     };
 
@@ -484,7 +508,7 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
                             src: move_arg_for(*arg),
                             dst: MoveArg::Stack{
                                 offset: offset as i64 + stack_size as i64,
-                                len: graph.object(*arg).t.as_ref().unwrap().size() as u64,
+                                len: size(graph.object(*arg).t.as_ref().unwrap()) as u64,
                             },
                         });
                     }
@@ -505,7 +529,7 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
                     });
 
                     instructions.push(Instruction{
-                        src: MoveArg::Word(graph.object(*dst).t.as_ref().unwrap().size() as u64),
+                        src: MoveArg::Word(size(graph.object(*dst).t.as_ref().unwrap()) as u64),
                         dst: MoveArg::ReturnValueLen,
                     });
 

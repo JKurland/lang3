@@ -1158,30 +1158,6 @@ impl Type {
             _ => {},
         }
     }
-
-    pub(crate) fn size(&self) -> usize {
-        match self {
-            Type::U32 => 4,
-            Type::Bool => 1,
-            Type::String => 16,
-            Type::Never => 0,
-            Type::Null => 0,
-            Type::Struct(_) => panic!("Struct not supported"),
-            Type::Compound(_, _) => panic!("Compound not supported"),
-        }
-    }
-
-    pub(crate) fn align(&self) -> usize {
-        match self {
-            Type::U32 => std::mem::align_of::<u32>(),
-            Type::Bool => 1,
-            Type::String => 16,
-            Type::Never => 1,
-            Type::Null => 1,
-            Type::Struct(_) => panic!("Struct not supported align"),
-            Type::Compound(_, _) => panic!("Compound not supported align"),
-        }
-    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
