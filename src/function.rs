@@ -62,6 +62,10 @@ enum FunctionAstType {
         lhs: Box<FunctionAst>,
         rhs: Box<FunctionAst>,
     },
+    Comma {
+        lhs: Box<FunctionAst>,
+        rhs: Option<Box<FunctionAst>>,
+    },
     ParenGroup {
         lhs: Option<Box<FunctionAst>>,
         inside: Option<Box<FunctionAst>>,
@@ -404,6 +408,7 @@ fn parse_if(token_stream: &[Token]) -> Result<FunctionAst> {
 enum OperatorType {
     Add,
     DoubleEq,
+    Comma,
     ParenGroup(usize),
 }
 
@@ -428,6 +433,18 @@ fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: us
                 Ok(FunctionAst{t: FunctionAstType::DoubleEq{
                     lhs: Box::new(parse_expr_inner(&operators[..root_op_idx], token_stream, left_end, root_op.idx - 1)?),
                     rhs: Box::new(parse_expr_inner(&operators[root_op_idx + 1..], token_stream, root_op.idx + 1, right_end)?),
+                }})
+            },
+            OperatorType::Comma => {
+                let rhs = if root_op.idx == right_end {
+                    None
+                } else {
+                    Some(Box::new(parse_expr_inner(&operators[root_op_idx + 1..], token_stream, root_op.idx + 1, right_end)?))
+                };
+
+                Ok(FunctionAst{t: FunctionAstType::Comma{
+                    lhs: Box::new(parse_expr_inner(&operators[..root_op_idx], token_stream, left_end, root_op.idx - 1)?),
+                    rhs,
                 }})
             },
             OperatorType::ParenGroup(open_idx) => {
@@ -481,9 +498,10 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
     let mut operators = Vec::new();
     operators.reserve(expr_body.len());
 
+    #[derive(Debug)]
     enum State {
         TopLevel,
-        InParens(usize),
+        InParens{open_idx: usize, depth: usize},
     }
 
     let mut state = State::TopLevel;
@@ -508,20 +526,33 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
                         });
                         state
                     },
-                    TokenType::OpenParen => State::InParens(idx),
+                    TokenType::Comma => {
+                        operators.push(Operator{
+                            t: OperatorType::Comma,
+                            idx,
+                            priority: -10,
+                        });
+                        state
+                    },
+                    TokenType::OpenParen => State::InParens{open_idx: idx, depth: 1},
                     _ => state,
                 }
             },
-            State::InParens(open_idx) => {
+            State::InParens{open_idx, depth} => {
                 match token.t {
                     TokenType::CloseParen => {
-                        operators.push(Operator{
-                            t: OperatorType::ParenGroup(open_idx),
-                            idx,
-                            priority: 100,
-                        });
-                        State::TopLevel
+                        if depth == 1 {
+                            operators.push(Operator{
+                                t: OperatorType::ParenGroup(open_idx),
+                                idx,
+                                priority: 100,
+                            });
+                            State::TopLevel
+                        } else {
+                            State::InParens{open_idx, depth: depth - 1}        
+                        }
                     },
+                    TokenType::OpenParen => State::InParens{open_idx, depth: depth + 1},
                     _ => state,
                 }
             },
@@ -529,7 +560,7 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
         state = new_state;
     }
 
-    if let State::InParens(_) = state {
+    if let State::InParens{..} = state {
         return Err(Error::new("Expected )"));
     }
 
@@ -564,6 +595,7 @@ pub(crate) enum InstructionType {
     StoreU32(ObjectHandle, u32),
     StoreString(ObjectHandle, String),
     StoreNull(ObjectHandle),
+    SetType(ObjectHandle, Type),
     Copy{
         src: ObjectHandle,
         dst: ObjectHandle,
@@ -599,9 +631,17 @@ pub(crate) enum JumpType {
 pub(crate) struct Jump {
     pub(crate) t: JumpType,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ObjectSource {
+    Argument(usize),
+    Local,
+}
+
 #[derive(Debug)]
 pub(crate) struct Object {
     pub(crate) t: Option<Type>,
+    pub(crate) source: ObjectSource,
 }
 
 #[derive(Debug)]
@@ -709,9 +749,9 @@ impl Graph {
     fn pop_scope(&mut self) {
         self.names.pop();
     }
-    fn add_name(&mut self, name: String) -> Result<ObjectHandle> {
-        let new_object = self.new_object();
-        let old_value = self.names.last_mut().unwrap().insert(name, new_object);
+    fn add_name(&mut self, name: &str, source: ObjectSource) -> Result<ObjectHandle> {
+        let new_object = self.new_object(source);
+        let old_value = self.names.last_mut().unwrap().insert(name.to_string(), new_object);
         if old_value.is_some() {
             return Err(Error::new("Name redefined"));
         } else {
@@ -760,19 +800,27 @@ impl Graph {
     fn num_objects(&self) -> usize {
         return self.objects.len();
     }
-    fn new_object(&mut self) -> ObjectHandle {
-        self.objects.push(Object{t: None});
+    fn new_object(&mut self, source: ObjectSource) -> ObjectHandle {
+        self.objects.push(Object{t: None, source});
         ObjectHandle(self.objects.len() - 1)
     }
 
-    pub(crate) fn from_function_ast(ast: &FunctionAst, return_type: Type, global_items: &HashMap<ItemPath, Item>) -> Result<Self> {
+    pub(crate) fn from_function_ast(ast: &FunctionAst, signature: FunctionSignature, global_items: &HashMap<ItemPath, Item>) -> Result<Self> {
+        let return_type = signature.return_type;
         let mut graph = Self::new();
-        let return_object = graph.new_object();
+        let return_object = graph.new_object(ObjectSource::Local);
+    
         let ctx = GraphBuildCtx{
             labels: Labels{break_: None},
             global_items,
             return_object,
         };
+
+        for (idx, arg) in signature.args.iter().enumerate() {
+            let arg_handle = graph.add_name(&arg.0, ObjectSource::Argument(idx))?;
+            graph.block_mut(graph.entry_block()).instructions.push(Instruction{t: InstructionType::SetType(arg_handle, arg.1.clone())});
+        }
+        graph.push_scope();
 
         let final_block = graph.evaluate_and_store(ast, graph.entry_block(), Some(return_object), &ctx)?;
 
@@ -800,7 +848,7 @@ impl Graph {
 
         match ast.t {
             FunctionAstType::IfStatement{ref condition, ref true_, ref false_ } => {
-                let cond_obj_handle = self.new_object();
+                let cond_obj_handle = self.new_object(ObjectSource::Local);
                 let after_eval_block = self.evaluate_and_store(&*condition, current_block, Some(cond_obj_handle), ctx)?;
 
                 let true_block = self.new_block();
@@ -912,38 +960,73 @@ impl Graph {
 
                 match lhs {
                     None => {
-                        let val = self.new_object();
+                        let val = self.new_object(ObjectSource::Local);
                         match inside {
                             None => Err(Error::new("Expected something inside parens")),
                             Some(inside) => self.evaluate_and_store(&**inside, current_block, Some(val), ctx),
                         }
                     },
                     Some(lhs) => {
+                        
                         let callee_path;
                         if let FunctionAstType::VarName(ref callee_name) = lhs.t {
                             callee_path = ItemPath::new(callee_name);
                         } else {
                             return Err(Error::new("Expected name before parens"))
                         }
+                        
+                        let mut block = current_block;
+                        let mut args: Vec<ObjectHandle> = vec![];
+                        if let Some(top_ast) = inside {
+                            let mut ast= top_ast;
+                            loop {
+                                match ast.t {
+                                    FunctionAstType::Comma{ref lhs, ref rhs} => {
+                                        let object_handle = self.new_object(ObjectSource::Local);
+                                        block = self.evaluate_and_store(lhs, block, Some(object_handle), ctx)?.ok_or(Error::new("Function arg doesn't evaluate"))?;
+                                        args.push(object_handle);
+
+                                        if let Some(ref rhs_ast) = rhs {
+                                            ast = rhs_ast;
+                                        } else {
+                                            break;
+                                        }
+                                    },
+                                    _ => {
+                                        let object_handle = self.new_object(ObjectSource::Local);
+                                        block = self.evaluate_and_store(ast, block, Some(object_handle), ctx)?.ok_or(Error::new("Function arg doesn't evaluate"))?;
+                                        args.push(object_handle);
+                                        break;
+                                    }
+                                };
+                            }
+                        }
 
                         let callee_item = ctx.global_items.get(&callee_path).ok_or(Error::new("Unknown item"))?;
 
                         if let ItemType::Fn(ref signature) = callee_item.t {
+                            if signature.args.len() != args.len() {
+                                return Err(Error::new("Wrong number of args for function"));
+                            }
+
                             let t = InstructionType::Call{
-                                dst: object_handle.unwrap_or_else(|| self.new_object()),
+                                dst: object_handle.unwrap_or_else(|| self.new_object(ObjectSource::Local)),
                                 callee: callee_path,
                                 signature: signature.clone(),
-                                args: vec![]
+                                args,
                             };
 
-                            self.block_mut(current_block).instructions.push(Instruction{t});
+                            self.block_mut(block).instructions.push(Instruction{t});
 
-                            Ok(Some(current_block))
+                            Ok(Some(block))
                         } else {
                             Err(Error::new("Can only call functions"))
                         }
                     },
                 }
+            },
+            FunctionAstType::Comma{..} => {
+                Err(Error::new("Cannot use comma operator outside of function arguments"))
             },
             FunctionAstType::U32(i) => {
                 if let Some(obj) = object_handle {
@@ -960,16 +1043,16 @@ impl Graph {
                 Ok(Some(current_block))
             },
             FunctionAstType::Add{ref lhs, ref rhs} => {
-                let lhs_obj = self.new_object();
+                let lhs_obj = self.new_object(ObjectSource::Local);
                 let mut cur_block = current_block;
                 cur_block = unwrap_block(self.evaluate_and_store(&*lhs, cur_block, Some(lhs_obj), ctx)?)?;
 
-                let rhs_obj = self.new_object();
+                let rhs_obj = self.new_object(ObjectSource::Local);
                 cur_block = unwrap_block(self.evaluate_and_store(&*rhs, cur_block, Some(rhs_obj), ctx)?)?;
 
                 let obj = match object_handle {
                     Some(obj) => obj,
-                    None => self.new_object(),
+                    None => self.new_object(ObjectSource::Local),
                 };
                 let block = self.block_mut(cur_block);
 
@@ -981,16 +1064,16 @@ impl Graph {
                 Ok(Some(cur_block))
             },
             FunctionAstType::DoubleEq{ref lhs, ref rhs} => {
-                let lhs_obj = self.new_object();
+                let lhs_obj = self.new_object(ObjectSource::Local);
                 let mut cur_block = current_block;
                 cur_block = unwrap_block(self.evaluate_and_store(&*lhs, cur_block, Some(lhs_obj), ctx)?)?;
 
-                let rhs_obj = self.new_object();
+                let rhs_obj = self.new_object(ObjectSource::Local);
                 cur_block = unwrap_block(self.evaluate_and_store(&*rhs, cur_block, Some(rhs_obj), ctx)?)?;
 
                 let obj = match object_handle {
                     Some(obj) => obj,
-                    None => self.new_object(),
+                    None => self.new_object(ObjectSource::Local),
                 };
                 let block = self.block_mut(cur_block);
 
@@ -1024,7 +1107,7 @@ impl Graph {
                 if let Some(obj) = object_handle {
                     self.block_mut(current_block).instructions.push(Instruction{t: InstructionType::StoreNull(obj)});
                 }
-                let var_obj = self.add_name(ident.clone())?;
+                let var_obj = self.add_name(&ident, ObjectSource::Local)?;
                 self.evaluate_and_store(&*value, current_block, Some(var_obj), ctx)
             },
             FunctionAstType::Assign{ref ident, ref value} => {
@@ -1085,6 +1168,18 @@ impl Type {
             Type::Null => 0,
             Type::Struct(_) => panic!("Struct not supported"),
             Type::Compound(_, _) => panic!("Compound not supported"),
+        }
+    }
+
+    pub(crate) fn align(&self) -> usize {
+        match self {
+            Type::U32 => std::mem::align_of::<u32>(),
+            Type::Bool => 1,
+            Type::String => 16,
+            Type::Never => 1,
+            Type::Null => 1,
+            Type::Struct(_) => panic!("Struct not supported align"),
+            Type::Compound(_, _) => panic!("Compound not supported align"),
         }
     }
 }
@@ -1150,6 +1245,9 @@ impl InferenceSystem {
                     },
                     InstructionType::StoreNull(dest) => {
                         is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::Null));
+                    },
+                    InstructionType::SetType(ref obj, ref t) => {
+                        is.add_eqn(TypeExpression::Placeholder(*obj), TypeExpression::Type(t.clone()));
                     },
                     InstructionType::Add{dest, lhs, rhs} => {
                         is.add_eqn(TypeExpression::Placeholder(lhs), TypeExpression::Type(Type::U32));
@@ -1359,15 +1457,15 @@ impl GetFunctionAst {
 }
 
 #[derive(Hash, PartialEq, Clone)]
-struct GetFunctionReturnType {
+struct GetFunctionSignature {
     path: ItemPath,
 }
 
-impl Query for GetFunctionReturnType {
-    type Output = Result<Type>;
+impl Query for GetFunctionSignature {
+    type Output = Result<FunctionSignature>;
 }
 
-impl GetFunctionReturnType {
+impl GetFunctionSignature {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
         let global_items_arc = make_query!(&prog, GetGlobalItems).await;
         if global_items_arc.is_err() {
@@ -1382,7 +1480,7 @@ impl GetFunctionReturnType {
 
         match item.t {
             ItemType::Fn(ref signature) => {
-                Ok(signature.return_type.clone())
+                Ok(signature.clone())
             },
             _ => return Err(Error::new("Not a function")),
         }
@@ -1400,16 +1498,16 @@ impl Query for GetFunctionGraph {
 
 impl GetFunctionGraph {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
-        let function_return_type_fut = make_query!(&prog, GetFunctionReturnType{path: self.path.clone()});
+        let function_signature_fut = make_query!(&prog, GetFunctionSignature{path: self.path.clone()});
         let function_ast_fut = make_query!(&prog, GetFunctionAst{path: self.path.clone()});
         let global_items_fut = make_query!(&prog, GetGlobalItems);
 
-        let (function_return_type_arc, function_ast_arc, global_items_arc) = join!(function_return_type_fut, function_ast_fut, global_items_fut);
+        let (function_signature_arc, function_ast_arc, global_items_arc) = join!(function_signature_fut, function_ast_fut, global_items_fut);
 
-        if function_return_type_arc.is_err() {
-            return Err(function_return_type_arc.as_ref().as_ref().unwrap_err().clone());
+        if function_signature_arc.is_err() {
+            return Err(function_signature_arc.as_ref().as_ref().unwrap_err().clone());
         }
-        let function_return_type = function_return_type_arc.as_ref().as_ref().unwrap();
+        let function_signature = function_signature_arc.as_ref().as_ref().unwrap();
 
         if function_ast_arc.is_err() {
             return Err(function_ast_arc.as_ref().as_ref().unwrap_err().clone());
@@ -1421,6 +1519,6 @@ impl GetFunctionGraph {
         let global_items = global_items_arc.as_ref().as_ref().unwrap();
 
         let function_ast = function_ast_arc.as_ref().as_ref().unwrap();
-        Graph::from_function_ast(function_ast, function_return_type.clone(), global_items)
+        Graph::from_function_ast(function_ast, function_signature.clone(), global_items)
     }
 }

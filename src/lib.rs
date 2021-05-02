@@ -373,4 +373,43 @@ mod tests {
             }"#
         ), Ok(5));
     }
+
+    #[test]
+    fn test_1_fn_arg() {
+        assert_eq!(run_main(r#"
+            fn add_2(a: u32) -> u32 {
+                return a + 2;
+            }
+
+            fn main() -> u32 {
+                return add_2(120) + 3;
+            }"#
+        ), Ok(125));
+    }
+
+    #[test]
+    fn test_2_fn_args() {
+        assert_eq!(run_main(r#"
+            fn add(a: u32, b: u32) -> u32 {
+                return a + b;
+            }
+
+            fn main() -> u32 {
+                return add(120, 5) + 3;
+            }"#
+        ), Ok(128));
+    }
+
+    #[test]
+    fn test_fn_args_exprs() {
+        assert_eq!(run_main(r#"
+            fn identity(a: u32) -> u32 {
+                return a;
+            }
+
+            fn main() -> u32 {
+                return identity(identity(10 + 5) + 3);
+            }"#
+        ), Ok(18));
+    }
 }

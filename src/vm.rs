@@ -1,5 +1,8 @@
+use function::Type;
+
 use crate::itemise::ItemPath;
 use std::collections::HashMap;
+use std::collections::binary_heap::Iter;
 use std::sync::Arc;
 use crate::function::{GetFunctionGraph, InstructionType, JumpType};
 use crate::{Error, Result};
@@ -52,6 +55,20 @@ pub(crate) enum MoveArg {
     Halt,
 
     None,
+}
+
+fn align_up_to(x: usize, align: usize) -> usize {
+    x + ((align - (x % align)) % align)
+}
+
+fn offsets<'a, T: Iterator<Item = &'a Type> + 'a>(types: T, initial: usize) -> impl Iterator<Item = usize> + 'a {
+    let mut total = initial;
+    types.map(move |t| {
+        total = align_up_to(total, t.align());
+        let ret = total;
+        total += t.size();
+        ret
+    })
 }
 
 #[derive(Debug)]
@@ -335,13 +352,45 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
     let mut dependencies = Vec::new();
 
     let (stack_offsets, stack_size) = {
-        let mut tmp = Storage::new();
-        let mut total = 0;
+        let mut args = vec![];
+        let mut locals = vec![];
+
         for handle in graph.objects() {
-            *tmp.get_mut(&handle) = Some(total);
-            total += graph.object(handle).t.as_ref().unwrap().size();
+            let object = graph.object(handle);
+            match object.source {
+                function::ObjectSource::Argument(idx) => {
+                    args.resize(idx + 1, None);
+                    args[idx] = Some(handle);
+                },
+                function::ObjectSource::Local => {
+                    locals.push(handle);
+                }
+            }
         }
-        (tmp, total)
+    
+        let mut stack_offsets = Storage::new();
+        let arg_types = args.iter().map(|arg| {
+            let handle = arg.expect("Missing arg index");
+            graph.object(handle).t.as_ref().unwrap()
+        }); 
+
+        let mut total = 0;
+        for (arg, offset) in args.iter().zip(offsets(arg_types, 0)) {
+            let handle = arg.expect("Missing arg index");
+            *stack_offsets.get_mut(&handle) = Some(offset);
+            total = offset;
+        } 
+
+        let local_types = locals.iter().map(|handle| {
+            graph.object(*handle).t.as_ref().unwrap()
+        });
+
+        for (handle, offset) in locals.iter().zip(offsets(local_types, total)) {
+            *stack_offsets.get_mut(handle) = Some(offset);
+            total = offset;
+        } 
+        
+        (stack_offsets, total)
     };
 
     let move_arg_for = |o: function::ObjectHandle| -> MoveArg {
@@ -402,8 +451,8 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
                         dst: move_arg_for_len(*dest, 8, 8),
                     });
                 },
-                InstructionType::StoreNull(_) => {
-                },
+                InstructionType::StoreNull(_) => {},
+                InstructionType::SetType(_, _) => {},
                 InstructionType::Add{dest, lhs, rhs} => {
                     instructions.push(Instruction{
                         src: move_arg_for(lhs),
@@ -427,11 +476,18 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
                     });
                 },
                 InstructionType::Call{ref dst, ref callee, ref signature, ref args} => {
-                    if !args.is_empty() {
-                        return Err(Error::new("function arguments not supported yet"));
-                    }
-
                     dependencies.push(callee.clone());
+
+                    let arg_offsets = offsets(signature.args.iter().map(|a|&a.1), 0);
+                    for (arg, offset) in args.iter().zip(arg_offsets) {
+                        instructions.push(Instruction{
+                            src: move_arg_for(*arg),
+                            dst: MoveArg::Stack{
+                                offset: offset as i64 + stack_size as i64,
+                                len: graph.object(*arg).t.as_ref().unwrap().size() as u64,
+                            },
+                        });
+                    }
 
                     instructions.push(Instruction{
                         src: MoveArg::StackIdx,

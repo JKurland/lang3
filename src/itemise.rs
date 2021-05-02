@@ -86,7 +86,7 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
                     },
                     TokenType::U32 => {
                         args.push((s, Type::U32));
-                        State::ArgsEnd
+                        State::ArgEnd
                     },
                     _ => return Err(Error::new("Expected type identifier")),
                 }

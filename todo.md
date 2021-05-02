@@ -1,1 +1,4 @@
-changed add_flow to evaluate_and_store, fix all the evaluate and store calls
+in vm implement args in call instruction, add args to the stack and make sure the stack is aligned to max alignment
+
+
+move align and size from function::Type to vm
