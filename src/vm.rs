@@ -2,10 +2,9 @@ use function::Type;
 
 use crate::itemise::ItemPath;
 use std::collections::HashMap;
-use std::collections::binary_heap::Iter;
 use std::sync::Arc;
 use crate::function::{GetFunctionGraph, InstructionType, JumpType};
-use crate::{Error, Result};
+use crate::Result;
 use crate::function;
 use crate::storage::Storage;
 

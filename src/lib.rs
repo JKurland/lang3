@@ -17,6 +17,7 @@ pub(crate) mod itemise;
 pub(crate) mod function;
 pub(crate) mod vm;
 pub(crate) mod storage;
+pub(crate) mod structs;
 
 
 #[derive(Debug, PartialEq, Clone)]

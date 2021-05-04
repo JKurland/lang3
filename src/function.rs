@@ -1125,10 +1125,10 @@ impl Graph {
 
 
 // Type System
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Eq)]
 pub(crate) enum Constuctor {}
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Eq)]
 pub(crate) enum Type {
     U32,
     Bool,
