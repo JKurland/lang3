@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_struct() {
+    fn test_struct_init_compiles() {
         assert_eq!(run_main(r#"
             struct S {
                 a: u32,
@@ -428,6 +428,7 @@ mod tests {
 
             fn main() -> u32 {
                 let s = S{a: 2};
+                return 18;
             }"#
         ), Ok(18));
     }
