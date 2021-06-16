@@ -60,6 +60,10 @@ enum FunctionAstType {
         lhs: Box<FunctionAst>,
         rhs: Box<FunctionAst>,
     },
+    Dot {
+        lhs: Box<FunctionAst>,
+        rhs: Box<FunctionAst>,
+    },
     DoubleEq {
         lhs: Box<FunctionAst>,
         rhs: Box<FunctionAst>,
@@ -423,23 +427,47 @@ enum OperatorType {
     Add,
     DoubleEq,
     Comma,
+    Dot,
     ParenGroup(usize),
     BraceGroup(usize),
 }
+
+#[derive(Debug)]
+enum Associativity {
+    Left,
+    Right,
+}
+
+impl Associativity {
+    fn idx_to_priority(&self, idx: usize) -> i32 {
+        match self {
+            Associativity::Left => -(idx as i32),
+            Associativity::Right => idx as i32,
+        }
+    }
+}
+
 
 #[derive(Debug)]
 struct Operator {
     t: OperatorType,
     idx: usize,
     priority: i32,
+    associativity: Associativity,
 }
 
 
 fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: usize, right_end: usize) -> Result<FunctionAst> {
-    if let Some((root_op_idx, root_op)) = operators.iter().enumerate().min_by_key(|o| o.1.priority) {
+    if let Some((root_op_idx, root_op)) = operators.iter().enumerate().min_by_key(|o| (o.1.priority, o.1.associativity.idx_to_priority(o.0))) {
         match root_op.t {
             OperatorType::Add => {
                 Ok(FunctionAst{t: FunctionAstType::Add{
+                    lhs: Box::new(parse_expr_inner(&operators[..root_op_idx], token_stream, left_end, root_op.idx - 1)?),
+                    rhs: Box::new(parse_expr_inner(&operators[root_op_idx + 1..], token_stream, root_op.idx + 1, right_end)?),
+                }})
+            },
+            OperatorType::Dot => {
+                Ok(FunctionAst{t: FunctionAstType::Dot{
                     lhs: Box::new(parse_expr_inner(&operators[..root_op_idx], token_stream, left_end, root_op.idx - 1)?),
                     rhs: Box::new(parse_expr_inner(&operators[root_op_idx + 1..], token_stream, root_op.idx + 1, right_end)?),
                 }})
@@ -654,6 +682,7 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
                             t: OperatorType::Add,
                             idx,
                             priority: 10,
+                            associativity: Associativity::Right,
                         });
                         state
                     },
@@ -662,6 +691,7 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
                             t: OperatorType::DoubleEq,
                             idx,
                             priority: 0,
+                            associativity: Associativity::Right,
                         });
                         state
                     },
@@ -670,6 +700,16 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
                             t: OperatorType::Comma,
                             idx,
                             priority: -10,
+                            associativity: Associativity::Right,
+                        });
+                        state
+                    },
+                    TokenType::Dot => {
+                        operators.push(Operator{
+                            t: OperatorType::Dot,
+                            idx,
+                            priority: 20,
+                            associativity: Associativity::Left,
                         });
                         state
                     },
@@ -686,6 +726,7 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
                                 t: OperatorType::ParenGroup(open_idx),
                                 idx,
                                 priority: 100,
+                                associativity: Associativity::Right,
                             });
                             State::TopLevel
                         } else {
@@ -699,6 +740,7 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
                                 t: OperatorType::BraceGroup(open_idx),
                                 idx,
                                 priority: 100,
+                                associativity: Associativity::Right,
                             });
                             State::TopLevel
                         } else {
@@ -766,6 +808,11 @@ pub(crate) enum InstructionType {
         parent_object: ObjectHandle,
         field: String,
         value: ObjectHandle,
+    },
+    StructFieldAccess{
+        parent_object: ObjectHandle,
+        field: String,
+        dest: ObjectHandle,
     },
 }
 
@@ -1208,13 +1255,12 @@ impl Graph {
                                     t: InstructionType::SetType(obj, Type::Struct(struct_path))
                                 });
                             }
-                            dbg!();
+
                             match inside {
                                 None => return Ok(Some(current_block)),
                                 Some(inside_ast) => {
                                     if let FunctionAstType::StructInit{ref fields} = inside_ast.t {
                                         for field in fields {
-                                            dbg!(field);
                                             if let FunctionAstType::StructFieldInit{ref field_name, ref value} = field.t {
                                                 let value_object = self.new_object(ObjectSource::Local);
                                                 cur_block = unwrap_block(
@@ -1247,6 +1293,24 @@ impl Graph {
                 },
                 FunctionAstType::StructFieldInit{..} => {
                     panic!("StructFieldInit outside of braces");
+                },
+                FunctionAstType::Dot{ref lhs, ref rhs} => {
+                    if let FunctionAstType::VarName(ref field_name) = rhs.t {
+                        let parent_object = self.new_object(ObjectSource::Local);
+                        let cur_block = self.evaluate_and_store(lhs, current_block, Some(parent_object), ctx).await?.ok_or(Error::new("Cannot field access never"))?;
+                        if let Some(dest) = object_handle {
+                            self.block_mut(cur_block).instructions.push(Instruction{
+                                t: InstructionType::StructFieldAccess {
+                                    parent_object,
+                                    field: field_name.clone(),
+                                    dest
+                                }
+                            });
+                        }
+                        return Ok(Some(cur_block));
+                    } else {
+                        return Err(Error::new("Expected field name after ."));
+                    }
                 },
                 FunctionAstType::Comma{..} => {
                     Err(Error::new("Cannot use comma operator outside of function arguments"))
@@ -1489,6 +1553,9 @@ impl InferenceSystem {
                     InstructionType::StructFieldAssignment{ref parent_object, ref field, ref value} => {
                         is.add_eqn(TypeExpression::Placeholder(*value), TypeExpression::StructField(*parent_object, field.clone()));
                     },
+                    InstructionType::StructFieldAccess{ref parent_object, ref field, ref dest} => {
+                        is.add_eqn(TypeExpression::Placeholder(*dest), TypeExpression::StructField(*parent_object, field.clone()));
+                    },
                 }
             }
 
@@ -1511,7 +1578,6 @@ impl InferenceSystem {
 
     async fn results(&mut self, graph: &mut Graph, prog: Arc<Program>) -> Result<()> {
         loop {
-            dbg!(&self.equations);
             self.delete_tautologies();
             self.decompose();
             self.check_conflict()?;

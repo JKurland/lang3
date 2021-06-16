@@ -676,6 +676,17 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
                         panic!("Field assignment on non struct");
                     }
                 },
+                InstructionType::StructFieldAccess{ref parent_object, ref field, ref dest} => {
+                    let parent_type = graph.object(*parent_object).t.as_ref().unwrap();
+                    if let Type::Struct(path) = parent_type {
+                        instructions.push(Instruction{
+                            src: offset_move_arg_for(*parent_object, field_offset(&path, prog.clone(), field).await?).await?,
+                            dst: move_arg_for(*dest).await?,
+                        });
+                    } else {
+                        panic!("Field access on non struct");
+                    }
+                },
             }
         }
 

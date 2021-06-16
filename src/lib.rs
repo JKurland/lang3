@@ -432,4 +432,52 @@ mod tests {
             }"#
         ), Ok(18));
     }
+
+    #[test]
+    fn test_struct_field_access() {
+        assert_eq!(run_main(r#"
+            struct S {
+                a: u32,
+            }
+
+            fn main() -> u32 {
+                let s = S{a: 2};
+                return s.a;
+            }"#
+        ), Ok(2));
+    }
+
+    #[test]
+    fn test_struct_field_access_2_fields() {
+        assert_eq!(run_main(r#"
+            struct S {
+                a: u32,
+                b: u32
+            }
+
+            fn main() -> u32 {
+                let s = S{a: 2, b: 1 + 3};
+                return s.b + s.a;
+            }"#
+        ), Ok(6));
+    }
+
+    #[test]
+    fn test_nested_struct() {
+        assert_eq!(run_main(r#"
+            struct A {
+                x: u32
+            }
+
+            struct S {
+                a: A,
+                a2: A,
+            }
+
+            fn main() -> u32 {
+                let s = S{a: A{x: 1}, a2: A{x: 3}};
+                return s.a.x + s.a2.x;
+            }"#
+        ), Ok(4));
+    }
 }
