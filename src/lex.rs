@@ -29,6 +29,7 @@ pub enum TokenType {
     CloseParen,
     Equal,
     Plus,
+    Dot,
     EOF,
 }
 
@@ -172,6 +173,7 @@ pub(crate) fn lex(mut s: &str) -> Result<Vec<Token>> {
         Box::new(Punctuation{c: ')', t: TokenType::CloseParen}),
         Box::new(Punctuation{c: '=', t: TokenType::Equal}),
         Box::new(Punctuation{c: '+', t: TokenType::Plus}),
+        Box::new(Punctuation{c: '.', t: TokenType::Dot}),
     ];
 
     let mut tokens: Vec<Token> = Vec::new();
@@ -272,12 +274,12 @@ mod test {
     #[test]
     fn test_as_query() {
         let prog = Arc::new(Program::new("if a; b".to_string()));
-        let token_stream = block_on(make_query!(&prog, GetTokenStream));
-        assert_eq!(*token_stream, Ok(vec![
+        let token_stream = block_on(make_query!(&prog, GetTokenStream)).unwrap();
+        assert_eq!(*token_stream, vec![
             Token{t: TokenType::If},
             Token{t: TokenType::Ident("a".to_string())},
             Token{t: TokenType::SemiColon},
             Token{t: TokenType::Ident("b".to_string())},
-        ]));
+        ]);
     }
 }

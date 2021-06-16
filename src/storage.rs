@@ -7,6 +7,7 @@ pub(crate) trait Handle {
     fn index(&self) -> usize;
 }
 
+#[derive(Clone)]
 pub(crate) struct Storage<I: Handle, T> {
     s: Vec<Option<T>>,
     phantom: PhantomData<I>,

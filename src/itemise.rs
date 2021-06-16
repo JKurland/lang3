@@ -231,11 +231,8 @@ impl Query for GetGlobalItems {
 
 impl GetGlobalItems {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
-        let tokens = make_query!(&prog, GetTokenStream).await;
-        match *tokens {
-            Ok(ref tokens) => itemise(tokens),
-            Err(ref e) => Err(e.clone()),
-        }
+        let tokens = make_query!(&prog, GetTokenStream).await?;
+        itemise(&tokens)
     }
 }
 

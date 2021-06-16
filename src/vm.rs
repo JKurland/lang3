@@ -1,12 +1,36 @@
 use function::Type;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 
 use crate::itemise::ItemPath;
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::function::{GetFunctionGraph, InstructionType, JumpType};
-use crate::Result;
+use crate::{Result, make_query};
 use crate::function;
 use crate::storage::Storage;
+use crate::Program;
+use crate::structs::GetStruct;
+
+#[derive(Clone, Copy)]
+struct SendPtr<T> {
+    p: *const T
+}
+
+impl<T> SendPtr<T> {
+    fn new(p: &T) -> Self {
+        Self{
+            p
+        }
+    }
+
+    unsafe fn deref(&self) -> &T {
+        &*self.p
+    }
+}
+
+unsafe impl<T> Sync for SendPtr<T> {}
+unsafe impl<T> Send for SendPtr<T> {}
 
 #[derive(Debug)]
 pub(crate) enum MoveArg {
@@ -56,42 +80,76 @@ pub(crate) enum MoveArg {
     None,
 }
 
-fn size(t: &Type) -> usize {
-    match t {
-        Type::U32 => 4,
-        Type::Bool => 1,
-        Type::String => 16,
-        Type::Never => 0,
-        Type::Null => 0,
-        Type::Struct(_) => panic!("Struct not supported"),
-        Type::Compound(_, _) => panic!("Compound not supported"),
-    }
+fn size<'a, 'b: 'a, 'c: 'a>(t: &'b Type, prog: &'c Arc<Program>) -> BoxFuture<'a, Result<usize>> {
+    async move {
+        match t {
+            Type::U32 => Ok(4),
+            Type::Bool => Ok(1),
+            Type::String => Ok(16),
+            Type::Never => Ok(0),
+            Type::Null => Ok(0),
+            Type::Struct(path) => {
+                let struct_ = make_query!(prog, GetStruct{path: path.clone()}).await?;
+                let mut s = 0;
+                for t in struct_.member_types() {
+                    s = align_up_to(s, align(t, prog).await?);
+                    s += size(t, prog).await?;
+                }
+                Ok(s)
+            },
+            Type::Compound(_, _) => panic!("Compound not supported"),
+        }
+    }.boxed()
 }
 
-fn align(t: &Type) -> usize {
-    match t {
-        Type::U32 => std::mem::align_of::<u32>(),
-        Type::Bool => 1,
-        Type::String => 16,
-        Type::Never => 1,
-        Type::Null => 1,
-        Type::Struct(_) => panic!("Struct not supported align"),
-        Type::Compound(_, _) => panic!("Compound not supported align"),
+fn align<'a, 'b: 'a, 'c: 'a>(t: &'b Type, prog: &'c Arc<Program>) -> BoxFuture<'a, Result<usize>> {
+    async move {
+        match t {
+            Type::U32 => Ok(std::mem::align_of::<u32>()),
+            Type::Bool => Ok(1),
+            Type::String => Ok(16),
+            Type::Never => Ok(1),
+            Type::Null => Ok(1),
+            Type::Struct(path) => {
+                let struct_ = make_query!(prog, GetStruct{path: path.clone()}).await?;
+                let first_type = struct_.member_types().next();
+                match first_type {
+                    Some(t) => {
+                        align(t, prog).await
+                    },
+                    None => Ok(1),
+                }
+            },
+            Type::Compound(_, _) => panic!("Compound not supported align"),
+        }
+    }.boxed()
+}
+
+async fn field_offset(struct_path: &ItemPath, prog: Arc<Program>, field_name: &str) -> Result<usize> {
+    let struct_ = make_query!(prog, GetStruct{path: struct_path.clone()}).await?;
+    let member_idx = struct_.member_idx(field_name).unwrap();
+    let mut s = 0;
+    for t in struct_.member_types().take(member_idx) {
+        s = align_up_to(s, align(t, &prog).await?);
+        s += size(t, &prog).await?;
     }
+    s = align_up_to(s, align(struct_.get_member(field_name).unwrap(), &prog).await?);
+    Ok(s)
 }
 
 fn align_up_to(x: usize, align: usize) -> usize {
     x + ((align - (x % align)) % align)
 }
 
-fn offsets<'a, T: Iterator<Item = &'a Type> + 'a>(types: T, initial: usize) -> impl Iterator<Item = usize> + 'a {
+async fn offsets<'a, T: Iterator<Item = &'a Type> + 'a>(types: T, initial: usize, prog: Arc<Program>) -> Result<Vec<usize>> {
     let mut total = initial;
-    types.map(move |t| {
-        total = align_up_to(total, align(t));
-        let ret = total;
-        total += size(t);
-        ret
-    })
+    let mut rtn = Vec::new();
+    for t in types {
+        total = align_up_to(total, align(t, &prog).await?);
+        rtn.push(total);
+        total += size(t, &prog).await?;
+    }
+    Ok(rtn)
 }
 
 #[derive(Debug)]
@@ -101,13 +159,13 @@ pub(crate) struct Instruction {
 }
 
 #[derive(Debug)]
-pub(crate) struct Program {
+pub(crate) struct VmProgram {
     pub(crate) instructions: Vec<Instruction>,
     pub(crate) constants: Vec<u8>,
     pub(crate) functions: HashMap<ItemPath, u64>,
 }
 
-impl Program {
+impl VmProgram {
     pub(crate) fn new() -> Self {
         Self {
             instructions: Vec::new(),
@@ -218,7 +276,7 @@ impl Vm {
         }
     }
 
-    pub(crate) fn run(&mut self, program: &Program) -> u64 {
+    pub(crate) fn run(&mut self, program: &VmProgram) -> u64 {
         loop {
             if self.skip_next != 0 {
                 self.skip_next = 0;
@@ -370,8 +428,7 @@ impl Vm {
 }
 
 
-
-fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool) -> Result<Vec<ItemPath>> {
+async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<Program>, halt_on_return: bool) -> Result<Vec<ItemPath>> {
     let mut dependencies = Vec::new();
 
     let (stack_offsets, stack_size) = {
@@ -390,7 +447,7 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
                 }
             }
         }
-    
+
         let mut stack_offsets = Storage::new();
         let arg_types = args.iter().map(|arg| {
             let handle = arg.expect("Missing arg index");
@@ -398,7 +455,7 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
         }); 
 
         let mut total = 0;
-        for (arg, offset) in args.iter().zip(offsets(arg_types, 0)) {
+        for (arg, offset) in args.iter().zip(offsets(arg_types, 0, prog.clone()).await?) {
             let handle = arg.expect("Missing arg index");
             *stack_offsets.get_mut(&handle) = Some(offset);
             total = offset;
@@ -408,7 +465,7 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
             graph.object(*handle).t.as_ref().unwrap()
         });
 
-        for (handle, offset) in locals.iter().zip(offsets(local_types, total)) {
+        for (handle, offset) in locals.iter().zip(offsets(local_types, total, prog.clone()).await?) {
             *stack_offsets.get_mut(handle) = Some(offset);
             total = offset;
         } 
@@ -416,10 +473,33 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
         (stack_offsets, total)
     };
 
-    let move_arg_for = |o: function::ObjectHandle| -> MoveArg {
-        MoveArg::Stack{
-            offset: *stack_offsets.get(&o).unwrap() as i64,
-            len: size(graph.object(o).t.as_ref().unwrap()) as u64
+    let move_arg_for = |o: function::ObjectHandle| {
+        let gp = SendPtr::new(graph);
+        let sop = SendPtr::new(&stack_offsets);
+        let pp = SendPtr::new(&prog);
+        async move {
+            // The returned future from this closure never outlives graph, stack_offsets or prog
+            unsafe {
+                Ok(MoveArg::Stack{
+                    offset: *(*sop.deref()).get(&o).unwrap() as i64,
+                    len: size((*gp.deref()).object(o).t.as_ref().unwrap(), &*pp.deref()).await? as u64
+                })
+            }
+        }
+    };
+
+    let offset_move_arg_for = |o: function::ObjectHandle, offset: usize| {
+        let gp = SendPtr::new(graph);
+        let sop = SendPtr::new(&stack_offsets);
+        let pp = SendPtr::new(&prog);
+        async move {
+            // The returned future from this closure never outlives graph, stack_offsets or prog
+            unsafe {
+                Ok(MoveArg::Stack{
+                    offset: (*(*sop.deref()).get(&o).unwrap() + offset) as i64,
+                    len: size((*gp.deref()).object(o).t.as_ref().unwrap(), &*pp.deref()).await? as u64
+                })
+            }
         }
     };
 
@@ -433,7 +513,7 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
 
     let mut block_offsets = Storage::new();
     block_offsets.reserve(graph.num_blocks());
-    let mut last_offset = prog.instructions.len();
+    let mut last_offset = vm_prog.instructions.len();
 
     for block in graph.blocks() {
         let mut instructions = Vec::new();
@@ -441,29 +521,29 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
             match instruction.t {
                 InstructionType::Eq{dest, lhs, rhs} => {
                     instructions.push(Instruction{
-                        src: move_arg_for(lhs),
+                        src: move_arg_for(lhs).await?,
                         dst: MoveArg::ValA,
                     });
 
                     instructions.push(Instruction{
-                        src: move_arg_for(rhs),
+                        src: move_arg_for(rhs).await?,
                         dst: MoveArg::ValB,
                     });
 
                     instructions.push(Instruction{
                         src: MoveArg::EqResult,
-                        dst: move_arg_for(dest),
+                        dst: move_arg_for(dest).await?,
                     });
                 },
                 InstructionType::StoreU32(dest, value) => {
                     instructions.push(Instruction{
                         src: MoveArg::Half(value),
-                        dst: move_arg_for(dest),
+                        dst: move_arg_for(dest).await?,
                     });
                 },
                 InstructionType::StoreString(ref dest, ref val) => {
-                    let const_idx = prog.constants.len();
-                    prog.constants.extend(val.bytes());
+                    let const_idx = vm_prog.constants.len();
+                    vm_prog.constants.extend(val.bytes());
                     instructions.push(Instruction{
                         src: MoveArg::AddressOfConstant{idx: const_idx as u64},
                         dst: move_arg_for_len(*dest, 8, 0),
@@ -478,36 +558,36 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
                 InstructionType::SetType(_, _) => {},
                 InstructionType::Add{dest, lhs, rhs} => {
                     instructions.push(Instruction{
-                        src: move_arg_for(lhs),
+                        src: move_arg_for(lhs).await?,
                         dst: MoveArg::ValA,
                     });
 
                     instructions.push(Instruction{
-                        src: move_arg_for(rhs),
+                        src: move_arg_for(rhs).await?,
                         dst: MoveArg::ValB,
                     });
 
                     instructions.push(Instruction{
                         src: MoveArg::AddU32Result,
-                        dst: move_arg_for(dest),
+                        dst: move_arg_for(dest).await?,
                     });
                 },
                 InstructionType::Copy{src, dst} => {
                     instructions.push(Instruction{
-                        src: move_arg_for(src),
-                        dst: move_arg_for(dst),
+                        src: move_arg_for(src).await?,
+                        dst: move_arg_for(dst).await?,
                     });
                 },
                 InstructionType::Call{ref dst, ref callee, ref signature, ref args} => {
                     dependencies.push(callee.clone());
 
-                    let arg_offsets = offsets(signature.args.iter().map(|a|&a.1), 0);
+                    let arg_offsets = offsets(signature.args.iter().map(|a|&a.1), 0, prog.clone()).await?;
                     for (arg, offset) in args.iter().zip(arg_offsets) {
                         instructions.push(Instruction{
-                            src: move_arg_for(*arg),
+                            src: move_arg_for(*arg).await?,
                             dst: MoveArg::Stack{
                                 offset: offset as i64 + stack_size as i64,
-                                len: size(graph.object(*arg).t.as_ref().unwrap()) as u64,
+                                len: size(graph.object(*arg).t.as_ref().unwrap(), &prog).await? as u64,
                             },
                         });
                     }
@@ -528,7 +608,7 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
                     });
 
                     instructions.push(Instruction{
-                        src: MoveArg::Word(size(graph.object(*dst).t.as_ref().unwrap()) as u64),
+                        src: MoveArg::Word(size(graph.object(*dst).t.as_ref().unwrap(), &prog).await? as u64),
                         dst: MoveArg::ReturnValueLen,
                     });
 
@@ -581,9 +661,20 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
                 },
                 InstructionType::Return{src} => {
                     instructions.push(Instruction{
-                        src: move_arg_for(src),
+                        src: move_arg_for(src).await?,
                         dst: MoveArg::ReturnValue,
                     });
+                },
+                InstructionType::StructFieldAssignment{ref parent_object, ref field, ref value} => {
+                    let parent_type = graph.object(*parent_object).t.as_ref().unwrap();
+                    if let Type::Struct(path) = parent_type {
+                        instructions.push(Instruction{
+                            src: move_arg_for(*value).await?,
+                            dst: offset_move_arg_for(*parent_object, field_offset(&path, prog.clone(), field).await?).await?
+                        });
+                    } else {
+                        panic!("Field assignment on non struct");
+                    }
                 },
             }
         }
@@ -617,7 +708,7 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
             },
             JumpType::Cond{condition, true_, false_} => {
                 instructions.push(Instruction{
-                    src: move_arg_for(condition),
+                    src: move_arg_for(condition).await?,
                     dst: MoveArg::SkipNext,
                 });
                 instructions.push(Instruction{
@@ -637,7 +728,7 @@ fn vm_program(graph: &function::Graph, prog: &mut Program, halt_on_return: bool)
             },
         }
     }
-    prog.instructions.extend(blocks.into_iter().flatten());
+    vm_prog.instructions.extend(blocks.into_iter().flatten());
     Ok(dependencies)
 }
 
@@ -648,12 +739,12 @@ pub(crate) struct GetFunctionVmProgram {
 }
 
 impl crate::Query for GetFunctionVmProgram {
-    type Output = Result<Program>;
+    type Output = Result<VmProgram>;
 }
 
 impl GetFunctionVmProgram {
     pub(crate) async fn make(self, prog: Arc<crate::Program>) -> <Self as crate::Query>::Output {
-        let mut vm_prog = Program::new();    
+        let mut vm_prog = VmProgram::new();    
         let mut deps = vec![self.path];
         let mut halt_on_return = true;
 
@@ -664,16 +755,12 @@ impl GetFunctionVmProgram {
                 deps.iter()
                 .map(|path| crate::make_query!(&prog, GetFunctionGraph{path: path.clone()}));
 
-            let graph_arcs = futures::future::join_all(graph_futures).await;
+            let graphs = futures::future::try_join_all(graph_futures).await?;
 
             let mut new_deps = Vec::new();
-            for (arc, path) in graph_arcs.iter().zip(&deps) {
-                if arc.is_err() {
-                    return Err(arc.as_ref().as_ref().unwrap_err().clone());
-                }
-
+            for (graph, path) in graphs.iter().zip(&deps) {
                 vm_prog.functions.insert(path.clone(), vm_prog.instructions.len() as u64);
-                new_deps.extend(vm_program(arc.as_ref().as_ref().unwrap(), &mut vm_prog, halt_on_return)?);
+                new_deps.extend(vm_program(graph, &mut vm_prog, prog.clone(), halt_on_return).await?);
                 halt_on_return = false;
             }
             deps = new_deps;

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::function::Type;
@@ -8,18 +7,50 @@ use crate::itemise::{GetGlobalItems, ItemPath, ItemType};
 
 
 #[derive(Debug, PartialEq, Eq)]
-struct Struct {
-    members: HashMap<String, Type>,
+pub(crate) struct Struct {
+    members: Vec<(String, Type)>,
 }
 
-
-fn add_member(members: &mut HashMap<String, Type>, name: String, t: Type) -> Result<()> {
-    let old_value = members.insert(name, t);
-    if old_value.is_some() {
-        return Err(Error::new("struct member name conflict"));
+impl Struct {
+    fn new() -> Self {
+        Self{
+            members: Vec::new()
+        }
     }
-    Ok(())
+
+    fn add_member(&mut self, name: String, t: Type) -> Result<()> {
+        for (field_name, _) in self.members.iter() {
+            if &name == field_name {
+                return Err(Error::new("struct member name conflict"));
+            }
+        }
+        self.members.push((name, t));
+        Ok(())
+    }
+
+    pub(crate) fn get_member(&self, name: &str) -> Option<&Type> {
+        for (field_name, t) in self.members.iter() {
+            if name == field_name {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn member_types(&self) -> impl Iterator<Item = &Type> {
+        self.members.iter().map(|m| &m.1)
+    }
+
+    pub(crate) fn member_idx(&self, name: &str) -> Option<usize> {
+        for (idx, (field_name, _)) in self.members.iter().enumerate() {
+            if name == field_name {
+                return Some(idx);
+            }
+        }
+        None
+    }
 }
+
 
 fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
     enum State {
@@ -30,7 +61,7 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
     }
 
     let mut state = State::MemberStart;
-    let mut members = HashMap::new();
+    let mut struct_ = Struct::new();
 
     for token in tokens {
         let new_state = match state {
@@ -57,11 +88,11 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
             State::AfterColon(name) => {
                 match &token.t {
                     TokenType::Ident(type_name) => {
-                        add_member(&mut members, name, Type::Struct(ItemPath::new(&type_name)))?;
+                        struct_.add_member(name, Type::Struct(ItemPath::new(&type_name)))?;
                         State::MemberEnd
                     },
                     TokenType::U32 => {
-                        add_member(&mut members, name, Type::U32)?;
+                        struct_.add_member(name, Type::U32)?;
                         State::MemberEnd
                     },
                     _ => {
@@ -85,7 +116,7 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
 
     match state {
         State::MemberStart | State::MemberEnd => {
-            Ok(Struct{members})
+            Ok(struct_)
         },
         _ => {
             Err(Error::new("Unexpected end of struct"))
@@ -101,8 +132,8 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
 
 
 #[derive(Hash, PartialEq, Clone)]
-struct GetStruct {
-    path: ItemPath,
+pub(crate) struct GetStruct {
+    pub(crate) path: ItemPath,
 }
 
 impl Query for GetStruct {
@@ -111,12 +142,7 @@ impl Query for GetStruct {
 
 impl GetStruct {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
-        let global_items_arc = make_query!(&prog, GetGlobalItems).await;
-        if global_items_arc.is_err() {
-            return Err(global_items_arc.as_ref().as_ref().unwrap_err().clone());
-        }
-
-        let global_items = global_items_arc.as_ref().as_ref().unwrap();
+        let global_items = make_query!(&prog, GetGlobalItems).await?;
 
         let item = global_items.get(&self.path).ok_or(
             Error::new("Could not find struct")
@@ -143,9 +169,9 @@ mod tests {
     #[test]
     fn test_parse_empty_struct() {
         let result = parse_struct_item(&lex(r#"
-        "#).unwrap());
+        "#).unwrap()).unwrap();
 
-        assert_eq!(result, Ok(Struct{members: HashMap::new()}));
+        assert_eq!(result.member_types().count(), 0);
     }
 
     #[test]
@@ -155,46 +181,46 @@ mod tests {
                 r#"
                     name: u32
                 "#,
-                Ok(Struct{members: hashmap!{
+                hashmap!{
                     "name".to_string() => Type::U32,
                 }
-            })),
+            ),
             (
                 r#"
                     name: hello
                 "#,
-                Ok(Struct{members: hashmap!{
+                hashmap!{
                     "name".to_string() => Type::Struct(ItemPath::new("hello")),
                 }
-            })),
+            ),
             (
                 r#"
                     name: hello,
                 "#,
-                Ok(Struct{members: hashmap!{
+                hashmap!{
                     "name".to_string() => Type::Struct(ItemPath::new("hello")),
                 }
-            })),
+            ),
             (
                 r#"
                     name: hello,
                     name2: u32
                 "#, 
-                Ok(Struct{members: hashmap!{
+                hashmap!{
                     "name".to_string() => Type::Struct(ItemPath::new("hello")),
                     "name2".to_string() => Type::U32,
                 }
-            })),
+            ),
             (
                 r#"
                     name: hello,
                     name2: u32,
                 "#, 
-                Ok(Struct{members: hashmap!{
+                hashmap!{
                     "name".to_string() => Type::Struct(ItemPath::new("hello")),
                     "name2".to_string() => Type::U32,
                 }
-            })),
+            ),
             (
                 r#"
                     name: hello,
@@ -203,18 +229,21 @@ mod tests {
                     hello: u32,
                     bla: hello,
                 "#, 
-                Ok(Struct{members: hashmap!{
+                hashmap!{
                     "name".to_string() => Type::Struct(ItemPath::new("hello")),
                     "name2".to_string() => Type::U32,
                     "name3".to_string() => Type::U32,
                     "hello".to_string() => Type::U32,
                     "bla".to_string() => Type::Struct(ItemPath::new("hello")),
                 }
-            })),
+            ),
         ];
 
         for example in examples {
-            assert_eq!(parse_struct_item(&lex(example.0).unwrap()), example.1);
+            let s = parse_struct_item(&lex(example.0).unwrap()).unwrap();
+            for (name, ty) in example.1.iter() {
+                assert_eq!(s.get_member(name).unwrap(), ty);
+            }
         }
     }
 }

@@ -21,7 +21,7 @@ pub(crate) mod structs;
 
 
 #[derive(Debug, PartialEq, Clone)]
-pub(crate) struct Error {
+pub struct Error {
     msg: String
 }
 
@@ -80,6 +80,7 @@ impl CacheKey {
 
 pub enum CacheEntry {
     Running(Shared<Receiver<()>>),
+    Failed(Box<dyn Any + Send + Sync>),
     Complete(Arc<dyn Any + Send + Sync>),
 }
 
@@ -91,11 +92,18 @@ pub struct Program {
     src: String,
 }
 
-async fn wrap_fut<T: Send + Sync + 'static, Fut: Future<Output = T>>(fut: Fut, sender: Sender<()>, prog: Arc<Program>, cache_key: CacheKey) {
-    let result = Arc::new(fut.await);
+async fn wrap_fut<T: Send + Sync + 'static, Fut: Future<Output = Result<T>>>(fut: Fut, sender: Sender<()>, prog: Arc<Program>, cache_key: CacheKey) {
+    let result = fut.await;
     let mut cache_entry = prog.result_cache.get_mut(&cache_key).unwrap();
     sender.send(()).expect("Receiver was dropped");
-    *cache_entry = CacheEntry::Complete(result);
+    match result {
+        Ok(ans) => {
+            *cache_entry = CacheEntry::Complete(Arc::new(ans));
+        },
+        Err(e) => {
+            *cache_entry = CacheEntry::Failed(Box::new(e));
+        }
+    }
 }
 
 impl Program {
@@ -107,9 +115,9 @@ impl Program {
         }
     }
 
-    pub async fn run_query<Q: Query, T: Sync + Send + 'static, Fut>(self: &Arc<Self>, query: Q, future: Fut) -> Arc<T>
+    pub async fn run_query<Q: Query, T: Sync + Send + 'static, Fut>(self: &Arc<Self>, query: Q, future: Fut) -> Result<Arc<T>>
     where
-    Fut: Future<Output = T> + Send + 'static {
+    Fut: Future<Output = Result<T>> + Send + 'static {
         let cache_key = CacheKey::new(query);
         self.result_cache.upsert(
             cache_key.clone(),
@@ -126,6 +134,7 @@ impl Program {
             let cache_entry = self.result_cache.get(&cache_key).unwrap();
             match *cache_entry {
                 CacheEntry::Running(ref fut) => Some(fut.clone()),
+                CacheEntry::Failed(_) => None,
                 CacheEntry::Complete(_) => None,
             }
         };
@@ -137,7 +146,8 @@ impl Program {
         let result_item = self.result_cache.get(&cache_key).unwrap();
         match *result_item {
             CacheEntry::Running(_) => panic!("Result is still not ready"),
-            CacheEntry::Complete(ref result) => result.clone().downcast::<T>().unwrap()
+            CacheEntry::Failed(ref error) => Err(error.as_ref().downcast_ref::<Error>().unwrap().clone()),
+            CacheEntry::Complete(ref result) => Ok(result.clone().downcast::<T>().unwrap()),
         }
     }
 
@@ -174,14 +184,9 @@ mod tests {
 
     fn run_main(src: &str) -> Result<u32> {
         let prog = Arc::new(Program::new(src.to_string()));
-        let program_arc = block_on(make_query!(&prog, GetFunctionVmProgram{
+        let program = block_on(make_query!(&prog, GetFunctionVmProgram{
             path: ItemPath::new("main"),
-        }));
-
-        if program_arc.is_err() {
-            return Err(program_arc.as_ref().as_ref().unwrap_err().clone());
-        }
-        let program = program_arc.as_ref().as_ref().unwrap();
+        }))?;
 
         let mut vm = vm::Vm::new(8092);
         Ok(vm.run(&program) as u32)
@@ -410,6 +415,19 @@ mod tests {
 
             fn main() -> u32 {
                 return identity(identity(10 + 5) + 3);
+            }"#
+        ), Ok(18));
+    }
+
+    #[test]
+    fn test_struct() {
+        assert_eq!(run_main(r#"
+            struct S {
+                a: u32,
+            }
+
+            fn main() -> u32 {
+                let s = S{a: 2};
             }"#
         ), Ok(18));
     }

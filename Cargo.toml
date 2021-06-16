@@ -17,7 +17,3 @@ libloading = "0.6"
 [dev-dependencies]
 criterion = "0.3.3"
 lang3 = {path = "."}
-
-[[bench]]
-name = "query_overhead"
-harness = false

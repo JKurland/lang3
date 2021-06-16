@@ -1,10 +1,12 @@
-use crate::itemise::{self, GetGlobalItems, ItemPath, ItemType, Item};
+use crate::itemise::{self, GetGlobalItems, ItemPath, ItemType};
 use crate::lex::{Token, TokenType};
 use crate::{Result, Error, Query, Program, make_query};
 use std::{collections::HashMap, sync::Arc};
-use futures::join;
+use futures::future::{BoxFuture, FutureExt};
+use futures::try_join;
 use itemise::FunctionSignature;
 use crate::storage::Handle;
+use crate::structs::GetStruct;
 
 // AST
 #[derive(Debug)]
@@ -71,7 +73,19 @@ enum FunctionAstType {
         inside: Option<Box<FunctionAst>>,
         rhs: Option<Box<FunctionAst>>,
     },
+    BraceGroup {
+        lhs: Option<Box<FunctionAst>>,
+        inside: Option<Box<FunctionAst>>,
+        rhs: Option<Box<FunctionAst>>,
+    },
     Break,
+    StructInit {
+        fields: Vec<Box<FunctionAst>>,
+    },
+    StructFieldInit {
+        field_name: String,
+        value: Box<FunctionAst>,
+    },
 }
 
 #[derive(Debug)]
@@ -410,6 +424,7 @@ enum OperatorType {
     DoubleEq,
     Comma,
     ParenGroup(usize),
+    BraceGroup(usize),
 }
 
 #[derive(Debug)]
@@ -448,9 +463,9 @@ fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: us
                 }})
             },
             OperatorType::ParenGroup(open_idx) => {
-                // By this point we've already handled all the operators where one of the operands can be a paren group
-                // since all their evalutation priorities are lower than that of ParenGroup. That means lhs and rhs must
-                // both be complete expressions since otherwise this ParenGroup would be one of their operands.
+                // Since the trinary operators (parens, braces) have a higher priority than al binary or unary operators
+                // we don't need to worry about the lhs or rhs being incomplete expressions. We do need to worry about
+                // the lhs or rhs being empty though.
                 let lhs = if left_end == open_idx {
                     None
                 } else {
@@ -471,6 +486,28 @@ fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: us
 
                 Ok(FunctionAst{t: FunctionAstType::ParenGroup{lhs, rhs, inside}})
             },
+            OperatorType::BraceGroup(open_idx) => {
+                let lhs = if left_end == open_idx {
+                    None
+                } else {
+                    Some(Box::new(parse_expr_inner(&operators[..root_op_idx], token_stream, left_end, open_idx - 1)?))
+                };
+
+                let rhs = if right_end == root_op.idx {
+                    None
+                } else {
+                    Some(Box::new(parse_expr_inner(&operators[root_op_idx + 1..], token_stream, root_op.idx + 1, right_end)?))
+                };
+
+                let inside = if open_idx + 1 == root_op.idx {
+                    None
+                } else {
+                    // atm in an expression the only thing
+                    Some(Box::new(parse_struct_init(&token_stream[open_idx+1..root_op.idx])?))
+                };
+
+                Ok(FunctionAst{t: FunctionAstType::BraceGroup{lhs, rhs, inside}})
+            },
         }
     } else {
         if left_end != right_end {
@@ -486,6 +523,102 @@ fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: us
     }
 }
 
+fn parse_struct_init(token_stream: &[Token]) -> Result<FunctionAst> {
+    #[derive(Debug, PartialEq)]
+    enum GroupType {
+        Paren,
+        Brace,
+    }
+
+    #[derive(Debug)]
+    enum State {
+        ExpectingFieldName,
+        ExpectingColon(String),
+        ExprTopLevel{expr_start: usize, field_name: String},
+        InGroup{expr_start: usize, field_name: String, depth: usize, group_type: GroupType},
+    }
+
+    let mut fields = Vec::new();
+    let mut state = State::ExpectingFieldName;
+
+    for (idx, token) in token_stream.iter().enumerate() {
+        let new_state = match state {
+            State::ExpectingFieldName => {
+                match token.t {
+                    TokenType::Ident(ref field_name) => {
+                        State::ExpectingColon(field_name.clone())
+                    },
+                    _ => {
+                        return Err(Error::new("Expecting field name"));
+                    }
+                }
+            },
+            State::ExpectingColon(field_name) => {
+                match token.t {
+                    TokenType::Colon => {
+                        State::ExprTopLevel{expr_start: idx + 1, field_name}
+                    },
+                    _ => {
+                        return Err(Error::new("Expecting colon"));
+                    }
+                }
+            },
+            State::ExprTopLevel{expr_start, field_name} => {
+                match token.t {
+                    TokenType::Comma => {
+                        fields.push(Box::new(FunctionAst{t: FunctionAstType::StructFieldInit{
+                            field_name: field_name,
+                            value: Box::new(parse_expr(&token_stream[expr_start..idx])?),
+                        }}));
+                        State::ExpectingFieldName
+                    },
+                    TokenType::OpenBrace => {
+                        State::InGroup{expr_start, field_name, depth: 1, group_type: GroupType::Brace}
+                    },
+                    TokenType::OpenParen => {
+                        State::InGroup{expr_start, field_name, depth: 1, group_type: GroupType::Paren}
+                    },
+                    _ => State::ExprTopLevel{expr_start, field_name}
+                }
+            },
+            State::InGroup{expr_start, field_name, depth, group_type} => {
+                let new_depth = match token.t {
+                    TokenType::OpenBrace if group_type == GroupType::Brace => {
+                        depth + 1
+                    },
+                    TokenType::CloseBrace if group_type == GroupType::Brace => {
+                        depth - 1
+                    },
+                    TokenType::OpenParen if group_type == GroupType::Paren => {
+                        depth + 1
+                    },
+                    TokenType::CloseParen if group_type == GroupType::Paren => {
+                        depth - 1
+                    },
+                    _ => depth,
+                };
+
+                if new_depth == 0 {
+                    State::ExprTopLevel{expr_start, field_name}
+                } else {
+                    State::InGroup{expr_start, field_name, depth: new_depth, group_type}
+                }
+            },
+        };
+        state = new_state;
+    }
+    
+    if let State::ExprTopLevel{expr_start, field_name} = state {
+        fields.push(Box::new(FunctionAst{t: FunctionAstType::StructFieldInit{
+            field_name: field_name,
+            value: Box::new(parse_expr(&token_stream[expr_start..])?),
+        }}));
+    }
+
+    Ok(FunctionAst{t: FunctionAstType::StructInit{fields}})
+}
+
+
 fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
     let expr_body = if token_stream.last() == Some(&Token{t: TokenType::SemiColon}) {
         &token_stream[0..token_stream.len()-1]
@@ -498,10 +631,16 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
     let mut operators = Vec::new();
     operators.reserve(expr_body.len());
 
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    enum GroupType {
+        Paren,
+        Brace,
+    }
+
     #[derive(Debug)]
     enum State {
         TopLevel,
-        InParens{open_idx: usize, depth: usize},
+        InGroup{open_idx: usize, depth: usize, group_type: GroupType},
     }
 
     let mut state = State::TopLevel;
@@ -534,13 +673,14 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
                         });
                         state
                     },
-                    TokenType::OpenParen => State::InParens{open_idx: idx, depth: 1},
+                    TokenType::OpenParen => State::InGroup{open_idx: idx, depth: 1, group_type: GroupType::Paren},
+                    TokenType::OpenBrace => State::InGroup{open_idx: idx, depth: 1, group_type: GroupType::Brace},
                     _ => state,
                 }
             },
-            State::InParens{open_idx, depth} => {
+            State::InGroup{open_idx, depth, group_type} => {
                 match token.t {
-                    TokenType::CloseParen => {
+                    TokenType::CloseParen if group_type == GroupType::Paren => {
                         if depth == 1 {
                             operators.push(Operator{
                                 t: OperatorType::ParenGroup(open_idx),
@@ -549,10 +689,23 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
                             });
                             State::TopLevel
                         } else {
-                            State::InParens{open_idx, depth: depth - 1}        
+                            State::InGroup{open_idx, depth: depth - 1, group_type}
                         }
                     },
-                    TokenType::OpenParen => State::InParens{open_idx, depth: depth + 1},
+                    TokenType::OpenParen if group_type == GroupType::Paren => State::InGroup{open_idx, depth: depth + 1, group_type},
+                    TokenType::CloseBrace if group_type == GroupType::Brace => {
+                        if depth == 1 {
+                            operators.push(Operator{
+                                t: OperatorType::BraceGroup(open_idx),
+                                idx,
+                                priority: 100,
+                            });
+                            State::TopLevel
+                        } else {
+                            State::InGroup{open_idx, depth: depth - 1, group_type}
+                        }
+                    },
+                    TokenType::OpenBrace if group_type == GroupType::Brace => State::InGroup{open_idx, depth: depth + 1, group_type},
                     _ => state,
                 }
             },
@@ -560,8 +713,8 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
         state = new_state;
     }
 
-    if let State::InParens{..} = state {
-        return Err(Error::new("Expected )"));
+    if let State::InGroup{..} = state {
+        return Err(Error::new("Expected close"));
     }
 
     // fill in the lhs and rhs of each operator
@@ -608,6 +761,11 @@ pub(crate) enum InstructionType {
     },
     Return{
         src: ObjectHandle,
+    },
+    StructFieldAssignment{
+        parent_object: ObjectHandle,
+        field: String,
+        value: ObjectHandle,
     },
 }
 
@@ -727,9 +885,9 @@ struct Labels {
 }
 
 #[derive(Clone)]
-struct GraphBuildCtx<'a> {
+struct GraphBuildCtx {
     labels: Labels,
-    global_items: &'a HashMap<ItemPath, Item>,
+    prog: Arc<Program>,
     return_object: ObjectHandle,
 }
 
@@ -805,14 +963,14 @@ impl Graph {
         ObjectHandle(self.objects.len() - 1)
     }
 
-    pub(crate) fn from_function_ast(ast: &FunctionAst, signature: FunctionSignature, global_items: &HashMap<ItemPath, Item>) -> Result<Self> {
+    pub(crate) async fn from_function_ast(ast: &FunctionAst, signature: FunctionSignature, prog: Arc<Program>) -> Result<Self> {
         let return_type = signature.return_type;
         let mut graph = Self::new();
         let return_object = graph.new_object(ObjectSource::Local);
     
         let ctx = GraphBuildCtx{
             labels: Labels{break_: None},
-            global_items,
+            prog: prog.clone(),
             return_object,
         };
 
@@ -822,7 +980,7 @@ impl Graph {
         }
         graph.push_scope();
 
-        let final_block = graph.evaluate_and_store(ast, graph.entry_block(), Some(return_object), &ctx)?;
+        let final_block = graph.evaluate_and_store(ast, graph.entry_block(), Some(return_object), &ctx).await?;
 
         if let Some(handle) = final_block {
             let block = graph.block_mut(handle);
@@ -832,7 +990,7 @@ impl Graph {
             }
         }
 
-        InferenceSystem::add_types(&mut graph, return_type, return_object)?;
+        InferenceSystem::add_types(&mut graph, prog.clone(), return_type, return_object).await?;
         for handle in graph.objects() {
             let object = graph.object(handle);
             if object.t.is_none() {
@@ -843,168 +1001,173 @@ impl Graph {
         Ok(graph)
     }
 
-    fn evaluate_and_store(&mut self, ast: &FunctionAst, current_block: BlockHandle, object_handle: Option<ObjectHandle>, ctx: &GraphBuildCtx) -> Result<Option<BlockHandle>> {
-        let unwrap_block = |b: Option<BlockHandle>| b.ok_or(Error::new("Unreachable Statement"));
+    fn evaluate_and_store<'a, 'b, 'c, 'd>(&'b mut self, ast: &'c FunctionAst, current_block: BlockHandle, object_handle: Option<ObjectHandle>, ctx: &'d GraphBuildCtx) -> BoxFuture<'a, Result<Option<BlockHandle>>>
+    where
+        'b: 'a,
+        'c: 'a,
+        'd: 'a
+    {
+        async move {
+            let unwrap_block = |b: Option<BlockHandle>| b.ok_or(Error::new("Unreachable Statement"));
 
-        match ast.t {
-            FunctionAstType::IfStatement{ref condition, ref true_, ref false_ } => {
-                let cond_obj_handle = self.new_object(ObjectSource::Local);
-                let after_eval_block = self.evaluate_and_store(&*condition, current_block, Some(cond_obj_handle), ctx)?;
+            match ast.t {
+                FunctionAstType::IfStatement{ref condition, ref true_, ref false_ } => {
+                    let cond_obj_handle = self.new_object(ObjectSource::Local);
+                    let after_eval_block = self.evaluate_and_store(&*condition, current_block, Some(cond_obj_handle), ctx).await?;
 
-                let true_block = self.new_block();
-                let false_block = self.new_block();
-                
-                self.block_mut(unwrap_block(after_eval_block)?).jump = Some(Jump{t: JumpType::Cond{
-                    condition: cond_obj_handle,
-                    true_: true_block,
-                    false_: false_block,
-                }});
+                    let true_block = self.new_block();
+                    let false_block = self.new_block();
+                    
+                    self.block_mut(unwrap_block(after_eval_block)?).jump = Some(Jump{t: JumpType::Cond{
+                        condition: cond_obj_handle,
+                        true_: true_block,
+                        false_: false_block,
+                    }});
 
-                let final_true_block = self.evaluate_and_store(
-                    &*true_,
-                    true_block,
-                    object_handle,
-                    ctx,
-                )?;
+                    let final_true_block = self.evaluate_and_store(
+                        &*true_,
+                        true_block,
+                        object_handle,
+                        ctx,
+                    ).await?;
 
-                let final_false_block = self.evaluate_and_store(
-                    &*false_,
-                    false_block,
-                    object_handle,
-                    ctx,
-                )?;
+                    let final_false_block = self.evaluate_and_store(
+                        &*false_,
+                        false_block,
+                        object_handle,
+                        ctx,
+                    ).await?;
 
-                let after_block = self.new_block();
-                let mut both_never = true;
+                    let after_block = self.new_block();
+                    let mut both_never = true;
 
-                for final_block in &[final_true_block, final_false_block] {
-                    match final_block {
-                        Some(block) => {
-                            both_never = false;
-                            if self.block(*block).jump.is_none() {
-                                self.block_mut(*block).jump = Some(Jump{t: JumpType::Uncond(after_block)});
+                    for final_block in &[final_true_block, final_false_block] {
+                        match final_block {
+                            Some(block) => {
+                                both_never = false;
+                                if self.block(*block).jump.is_none() {
+                                    self.block_mut(*block).jump = Some(Jump{t: JumpType::Uncond(after_block)});
+                                }
+                            },
+                            None => {
+                                if let Some(obj) = object_handle {
+                                    self.never_objects.push(obj)
+                                }
+                            }
+                        }
+                    }
+
+                    if both_never {
+                        Ok(None)
+                    } else {
+                        Ok(Some(after_block))
+                    }
+                },
+                FunctionAstType::Loop{ref body, ref contains_break} => {
+                    let body_block = self.new_block();
+                    self.block_mut(current_block).jump = Some(Jump{t: JumpType::Uncond(body_block)});
+
+                    let after_block = self.new_block();
+
+                    let mut loop_ctx = ctx.clone();
+                    loop_ctx.labels.break_ = Some(after_block);
+
+                    let final_block = self.evaluate_and_store(&*body, body_block, None, &loop_ctx).await?;
+                    self.block_mut(unwrap_block(final_block)?).jump = Some(Jump{t: JumpType::Uncond(body_block)});
+
+                    if let Some(obj) = object_handle {
+                        if *contains_break {
+                            self.block_mut(after_block).instructions.push(Instruction{t: InstructionType::StoreNull(obj)});
+                        } else {
+                            self.never_objects.push(obj);
+                        }
+                    }
+
+                    Ok(Some(after_block))
+                },
+                FunctionAstType::Break => {
+                    self.block_mut(current_block).jump = Some(Jump{
+                        t: JumpType::Uncond(ctx.labels.break_.ok_or(Error::new("Break must be inside loop"))?)
+                    });
+                    Ok(None)
+                },
+                FunctionAstType::Scope{ref items, ending_semicolon} => {
+                    let mut block_handle = Some(current_block);
+
+                    if items.len() == 0 {
+                        if let Some(obj) = object_handle {
+                            self.block_mut(current_block).instructions.push(Instruction{t: InstructionType::StoreNull(obj)});
+                        }
+                        return Ok(block_handle);
+                    }
+
+                    self.push_scope();
+                    for (idx, item) in items.iter().enumerate() {
+                        let mut obj = None;
+                        if !ending_semicolon && idx == items.len() - 1 {
+                            obj = object_handle;
+                        }
+                        block_handle = self.evaluate_and_store(item, unwrap_block(block_handle)?, obj, ctx).await?;
+                    }
+
+                    if let None = block_handle {
+
+                    }
+
+                    self.pop_scope();
+                    Ok(block_handle)
+                },
+                FunctionAstType::ParenGroup{ref lhs, ref inside, ref rhs} => {
+                    if rhs.is_some() {
+                        return Err(Error::new("Paren group not supported as prefix operator"));
+                    }
+
+                    match lhs {
+                        None => {
+                            let val = self.new_object(ObjectSource::Local);
+                            match inside {
+                                None => Err(Error::new("Expected something inside parens")),
+                                Some(inside) => self.evaluate_and_store(&**inside, current_block, Some(val), ctx).await,
                             }
                         },
-                        None => {
-                            if let Some(obj) = object_handle {
-                                self.never_objects.push(obj)
+                        Some(lhs) => {
+                            
+                            let callee_path;
+                            if let FunctionAstType::VarName(ref callee_name) = lhs.t {
+                                callee_path = ItemPath::new(callee_name);
+                            } else {
+                                return Err(Error::new("Expected name before parens"))
                             }
-                        }
-                    }
-                }
+                            
+                            let mut block = current_block;
+                            let mut args: Vec<ObjectHandle> = vec![];
+                            if let Some(top_ast) = inside {
+                                let mut ast= top_ast;
+                                loop {
+                                    match ast.t {
+                                        FunctionAstType::Comma{ref lhs, ref rhs} => {
+                                            let object_handle = self.new_object(ObjectSource::Local);
+                                            block = self.evaluate_and_store(lhs, block, Some(object_handle), ctx).await?.ok_or(Error::new("Function arg doesn't evaluate"))?;
+                                            args.push(object_handle);
 
-                if both_never {
-                    Ok(None)
-                } else {
-                    Ok(Some(after_block))
-                }
-            },
-            FunctionAstType::Loop{ref body, ref contains_break} => {
-                let body_block = self.new_block();
-                self.block_mut(current_block).jump = Some(Jump{t: JumpType::Uncond(body_block)});
-
-                let after_block = self.new_block();
-
-                let mut loop_ctx = ctx.clone();
-                loop_ctx.labels.break_ = Some(after_block);
-
-                let final_block = self.evaluate_and_store(&*body, body_block, None, &loop_ctx)?;
-                self.block_mut(unwrap_block(final_block)?).jump = Some(Jump{t: JumpType::Uncond(body_block)});
-
-                if let Some(obj) = object_handle {
-                    if *contains_break {
-                        self.block_mut(after_block).instructions.push(Instruction{t: InstructionType::StoreNull(obj)});
-                    } else {
-                        self.never_objects.push(obj);
-                    }
-                }
-
-                Ok(Some(after_block))
-            },
-            FunctionAstType::Break => {
-                self.block_mut(current_block).jump = Some(Jump{
-                    t: JumpType::Uncond(ctx.labels.break_.ok_or(Error::new("Break must be inside loop"))?)
-                });
-                Ok(None)
-            },
-            FunctionAstType::Scope{ref items, ending_semicolon} => {
-                let mut block_handle = Some(current_block);
-
-                if items.len() == 0 {
-                    if let Some(obj) = object_handle {
-                        self.block_mut(current_block).instructions.push(Instruction{t: InstructionType::StoreNull(obj)});
-                    }
-                    return Ok(block_handle);
-                }
-
-                self.push_scope();
-                for (idx, item) in items.iter().enumerate() {
-                    let mut obj = None;
-                    if !ending_semicolon && idx == items.len() - 1 {
-                        obj = object_handle;
-                    }
-                    block_handle = self.evaluate_and_store(item, unwrap_block(block_handle)?, obj, ctx)?;
-                }
-
-                if let None = block_handle {
-
-                }
-
-                self.pop_scope();
-                Ok(block_handle)
-            },
-            FunctionAstType::ParenGroup{ref lhs, ref inside, ref rhs} => {
-                if rhs.is_some() {
-                    return Err(Error::new("Paren group not supported as prefix operator"));
-                }
-
-                match lhs {
-                    None => {
-                        let val = self.new_object(ObjectSource::Local);
-                        match inside {
-                            None => Err(Error::new("Expected something inside parens")),
-                            Some(inside) => self.evaluate_and_store(&**inside, current_block, Some(val), ctx),
-                        }
-                    },
-                    Some(lhs) => {
-                        
-                        let callee_path;
-                        if let FunctionAstType::VarName(ref callee_name) = lhs.t {
-                            callee_path = ItemPath::new(callee_name);
-                        } else {
-                            return Err(Error::new("Expected name before parens"))
-                        }
-                        
-                        let mut block = current_block;
-                        let mut args: Vec<ObjectHandle> = vec![];
-                        if let Some(top_ast) = inside {
-                            let mut ast= top_ast;
-                            loop {
-                                match ast.t {
-                                    FunctionAstType::Comma{ref lhs, ref rhs} => {
-                                        let object_handle = self.new_object(ObjectSource::Local);
-                                        block = self.evaluate_and_store(lhs, block, Some(object_handle), ctx)?.ok_or(Error::new("Function arg doesn't evaluate"))?;
-                                        args.push(object_handle);
-
-                                        if let Some(ref rhs_ast) = rhs {
-                                            ast = rhs_ast;
-                                        } else {
+                                            if let Some(ref rhs_ast) = rhs {
+                                                ast = rhs_ast;
+                                            } else {
+                                                break;
+                                            }
+                                        },
+                                        _ => {
+                                            let object_handle = self.new_object(ObjectSource::Local);
+                                            block = self.evaluate_and_store(ast, block, Some(object_handle), ctx).await?.ok_or(Error::new("Function arg doesn't evaluate"))?;
+                                            args.push(object_handle);
                                             break;
                                         }
-                                    },
-                                    _ => {
-                                        let object_handle = self.new_object(ObjectSource::Local);
-                                        block = self.evaluate_and_store(ast, block, Some(object_handle), ctx)?.ok_or(Error::new("Function arg doesn't evaluate"))?;
-                                        args.push(object_handle);
-                                        break;
-                                    }
-                                };
+                                    };
+                                }
                             }
-                        }
 
-                        let callee_item = ctx.global_items.get(&callee_path).ok_or(Error::new("Unknown item"))?;
+                            let signature = make_query!(ctx.prog, GetFunctionSignature{path: callee_path.clone()}).await?;
 
-                        if let ItemType::Fn(ref signature) = callee_item.t {
                             if signature.args.len() != args.len() {
                                 return Err(Error::new("Wrong number of args for function"));
                             }
@@ -1012,112 +1175,173 @@ impl Graph {
                             let t = InstructionType::Call{
                                 dst: object_handle.unwrap_or_else(|| self.new_object(ObjectSource::Local)),
                                 callee: callee_path,
-                                signature: signature.clone(),
+                                signature: signature.as_ref().clone(),
                                 args,
                             };
 
                             self.block_mut(block).instructions.push(Instruction{t});
 
                             Ok(Some(block))
-                        } else {
-                            Err(Error::new("Can only call functions"))
+                        },
+                    }
+                },
+                FunctionAstType::BraceGroup{ref lhs, ref inside, ref rhs} => {
+                    if rhs.is_some() {
+                        return Err(Error::new("Brace group not supported as prefix operator"));
+                    }
+
+                    match lhs {
+                        None => return Err(Error::new("Brace group must be preceded by struct name")),
+                        Some(lhs) => {
+                            // doing struct init
+
+                            let struct_path;
+                            if let FunctionAstType::VarName(ref struct_name) = lhs.t {
+                                struct_path = ItemPath::new(struct_name);
+                            } else {
+                                return Err(Error::new("Expected name before parens"))
+                            }
+
+                            let mut cur_block = current_block;
+                            if let Some(obj) = object_handle {
+                                self.block_mut(cur_block).instructions.push(Instruction{
+                                    t: InstructionType::SetType(obj, Type::Struct(struct_path))
+                                });
+                            }
+                            dbg!();
+                            match inside {
+                                None => return Ok(Some(current_block)),
+                                Some(inside_ast) => {
+                                    if let FunctionAstType::StructInit{ref fields} = inside_ast.t {
+                                        for field in fields {
+                                            dbg!(field);
+                                            if let FunctionAstType::StructFieldInit{ref field_name, ref value} = field.t {
+                                                let value_object = self.new_object(ObjectSource::Local);
+                                                cur_block = unwrap_block(
+                                                    self.evaluate_and_store(&value, cur_block, Some(value_object), ctx).await?
+                                                )?;
+
+                                                if let Some(obj) = object_handle {
+                                                    let block = self.block_mut(cur_block);
+                                                    block.instructions.push(Instruction{t: InstructionType::StructFieldAssignment{
+                                                        parent_object: obj,
+                                                        field: field_name.clone(),
+                                                        value: value_object,
+                                                    }});
+                                                }
+                                            } else {
+                                                panic!("Not a struct init field inside braces");        
+                                            }
+                                        }
+                                    } else {
+                                        panic!("Not a struct init inside braces");
+                                    }
+                                }
+                            }
+                            Ok(Some(cur_block))
                         }
-                    },
-                }
-            },
-            FunctionAstType::Comma{..} => {
-                Err(Error::new("Cannot use comma operator outside of function arguments"))
-            },
-            FunctionAstType::U32(i) => {
-                if let Some(obj) = object_handle {
+                    }
+                },
+                FunctionAstType::StructInit{..} => {
+                    panic!("StructInit outside of braces");
+                },
+                FunctionAstType::StructFieldInit{..} => {
+                    panic!("StructFieldInit outside of braces");
+                },
+                FunctionAstType::Comma{..} => {
+                    Err(Error::new("Cannot use comma operator outside of function arguments"))
+                },
+                FunctionAstType::U32(i) => {
+                    if let Some(obj) = object_handle {
+                        let block = self.block_mut(current_block);
+                        block.instructions.push(Instruction{t: InstructionType::StoreU32(obj, i)});
+                    }
+                    Ok(Some(current_block))
+                },
+                FunctionAstType::StringLiteral(ref s) => {
+                    if let Some(obj) = object_handle {
+                        let block = self.block_mut(current_block);
+                        block.instructions.push(Instruction{t: InstructionType::StoreString(obj, s.clone())});
+                    }
+                    Ok(Some(current_block))
+                },
+                FunctionAstType::Add{ref lhs, ref rhs} => {
+                    let lhs_obj = self.new_object(ObjectSource::Local);
+                    let mut cur_block = current_block;
+                    cur_block = unwrap_block(self.evaluate_and_store(&*lhs, cur_block, Some(lhs_obj), ctx).await?)?;
+
+                    let rhs_obj = self.new_object(ObjectSource::Local);
+                    cur_block = unwrap_block(self.evaluate_and_store(&*rhs, cur_block, Some(rhs_obj), ctx).await?)?;
+
+                    let obj = match object_handle {
+                        Some(obj) => obj,
+                        None => self.new_object(ObjectSource::Local),
+                    };
+                    let block = self.block_mut(cur_block);
+
+                    block.instructions.push(Instruction{t: InstructionType::Add{
+                        dest: obj,
+                        lhs: lhs_obj,
+                        rhs: rhs_obj,
+                    }});
+                    Ok(Some(cur_block))
+                },
+                FunctionAstType::DoubleEq{ref lhs, ref rhs} => {
+                    let lhs_obj = self.new_object(ObjectSource::Local);
+                    let mut cur_block = current_block;
+                    cur_block = unwrap_block(self.evaluate_and_store(&*lhs, cur_block, Some(lhs_obj), ctx).await?)?;
+
+                    let rhs_obj = self.new_object(ObjectSource::Local);
+                    cur_block = unwrap_block(self.evaluate_and_store(&*rhs, cur_block, Some(rhs_obj), ctx).await?)?;
+
+                    let obj = match object_handle {
+                        Some(obj) => obj,
+                        None => self.new_object(ObjectSource::Local),
+                    };
+                    let block = self.block_mut(cur_block);
+
+                    block.instructions.push(Instruction{t: InstructionType::Eq{
+                        dest: obj,
+                        lhs: lhs_obj,
+                        rhs: rhs_obj,
+                    }});
+                    Ok(Some(cur_block))
+                },
+                FunctionAstType::VarName(ref s) => {
+                    let src = self.get_name(s)?;
                     let block = self.block_mut(current_block);
-                    block.instructions.push(Instruction{t: InstructionType::StoreU32(obj, i)});
-                }
-                Ok(Some(current_block))
-            },
-            FunctionAstType::StringLiteral(ref s) => {
-                if let Some(obj) = object_handle {
-                    let block = self.block_mut(current_block);
-                    block.instructions.push(Instruction{t: InstructionType::StoreString(obj, s.clone())});
-                }
-                Ok(Some(current_block))
-            },
-            FunctionAstType::Add{ref lhs, ref rhs} => {
-                let lhs_obj = self.new_object(ObjectSource::Local);
-                let mut cur_block = current_block;
-                cur_block = unwrap_block(self.evaluate_and_store(&*lhs, cur_block, Some(lhs_obj), ctx)?)?;
+                    if let Some(obj) = object_handle {
+                        block.instructions.push(Instruction{t: InstructionType::Copy{src, dst: obj}});
+                    }
+                    Ok(Some(current_block))
+                },
+                FunctionAstType::Return(ref value) => {
+                    let after_eval_block = unwrap_block(self.evaluate_and_store(&*value, current_block, Some(ctx.return_object), ctx).await?)?;
+                    let block = self.block_mut(after_eval_block);
+                    block.jump = Some(Jump{t: JumpType::Return});
+                    block.instructions.push(Instruction{t: InstructionType::Return{src: ctx.return_object}});
 
-                let rhs_obj = self.new_object(ObjectSource::Local);
-                cur_block = unwrap_block(self.evaluate_and_store(&*rhs, cur_block, Some(rhs_obj), ctx)?)?;
-
-                let obj = match object_handle {
-                    Some(obj) => obj,
-                    None => self.new_object(ObjectSource::Local),
-                };
-                let block = self.block_mut(cur_block);
-
-                block.instructions.push(Instruction{t: InstructionType::Add{
-                    dest: obj,
-                    lhs: lhs_obj,
-                    rhs: rhs_obj,
-                }});
-                Ok(Some(cur_block))
-            },
-            FunctionAstType::DoubleEq{ref lhs, ref rhs} => {
-                let lhs_obj = self.new_object(ObjectSource::Local);
-                let mut cur_block = current_block;
-                cur_block = unwrap_block(self.evaluate_and_store(&*lhs, cur_block, Some(lhs_obj), ctx)?)?;
-
-                let rhs_obj = self.new_object(ObjectSource::Local);
-                cur_block = unwrap_block(self.evaluate_and_store(&*rhs, cur_block, Some(rhs_obj), ctx)?)?;
-
-                let obj = match object_handle {
-                    Some(obj) => obj,
-                    None => self.new_object(ObjectSource::Local),
-                };
-                let block = self.block_mut(cur_block);
-
-                block.instructions.push(Instruction{t: InstructionType::Eq{
-                    dest: obj,
-                    lhs: lhs_obj,
-                    rhs: rhs_obj,
-                }});
-                Ok(Some(cur_block))
-            },
-            FunctionAstType::VarName(ref s) => {
-                let src = self.get_name(s)?;
-                let block = self.block_mut(current_block);
-                if let Some(obj) = object_handle {
-                    block.instructions.push(Instruction{t: InstructionType::Copy{src, dst: obj}});
-                }
-                Ok(Some(current_block))
-            },
-            FunctionAstType::Return(ref value) => {
-                let after_eval_block = unwrap_block(self.evaluate_and_store(&*value, current_block, Some(ctx.return_object), ctx)?)?;
-                let block = self.block_mut(after_eval_block);
-                block.jump = Some(Jump{t: JumpType::Return});
-                block.instructions.push(Instruction{t: InstructionType::Return{src: ctx.return_object}});
-
-                if let Some(obj) = object_handle {
-                    self.never_objects.push(obj);
-                }
-                Ok(None)
-            },
-            FunctionAstType::Let{ref ident, t: _, ref value} => {
-                if let Some(obj) = object_handle {
-                    self.block_mut(current_block).instructions.push(Instruction{t: InstructionType::StoreNull(obj)});
-                }
-                let var_obj = self.add_name(&ident, ObjectSource::Local)?;
-                self.evaluate_and_store(&*value, current_block, Some(var_obj), ctx)
-            },
-            FunctionAstType::Assign{ref ident, ref value} => {
-                if let Some(obj) = object_handle {
-                    self.block_mut(current_block).instructions.push(Instruction{t: InstructionType::StoreNull(obj)});
-                }
-                let var_obj = self.get_name(&ident)?;
-                self.evaluate_and_store(&*value, current_block, Some(var_obj), ctx)
-            },
-        }
+                    if let Some(obj) = object_handle {
+                        self.never_objects.push(obj);
+                    }
+                    Ok(None)
+                },
+                FunctionAstType::Let{ref ident, t: _, ref value} => {
+                    if let Some(obj) = object_handle {
+                        self.block_mut(current_block).instructions.push(Instruction{t: InstructionType::StoreNull(obj)});
+                    }
+                    let var_obj = self.add_name(&ident, ObjectSource::Local)?;
+                    self.evaluate_and_store(&*value, current_block, Some(var_obj), ctx).await
+                },
+                FunctionAstType::Assign{ref ident, ref value} => {
+                    if let Some(obj) = object_handle {
+                        self.block_mut(current_block).instructions.push(Instruction{t: InstructionType::StoreNull(obj)});
+                    }
+                    let var_obj = self.get_name(&ident)?;
+                    self.evaluate_and_store(&*value, current_block, Some(var_obj), ctx).await
+                },
+            }
+        }.boxed()
     }
 }
 
@@ -1164,6 +1388,7 @@ impl Type {
 enum TypeExpression {
     Type(Type),
     Placeholder(ObjectHandle),
+    StructField(ObjectHandle, String),
 }
 
 impl TypeExpression {
@@ -1171,17 +1396,36 @@ impl TypeExpression {
         match self {
             TypeExpression::Type(t) => t.depends_on(obj),
             TypeExpression::Placeholder(other) => obj == *other,
+            TypeExpression::StructField(other, _) => obj == *other,
         }
     }
 
-    fn do_substitutions(&mut self, graph: &Graph) {
+    async fn do_substitutions(&mut self, graph: &Graph, prog: Arc<Program>) -> Result<()>{
         match self {
-            TypeExpression::Type(t) => t.do_substitutions(graph),
+            TypeExpression::Type(t) => {
+                t.do_substitutions(graph);
+                Ok(())
+            },
             TypeExpression::Placeholder(obj) => {
                 if let Some(ref sub) = graph.object(*obj).t {
                     *self = TypeExpression::Type(sub.clone());
                 }
+                Ok(())
             },
+            TypeExpression::StructField(parent, field) => {
+                if let Some(ref parent_type) = graph.object(*parent).t {
+                    if let Type::Struct(ref item_path) = parent_type {
+                        let s = make_query!(prog, GetStruct{path: item_path.clone()}).await?;
+                        *self = match s.get_member(field) {
+                            Some(t) => TypeExpression::Type(t.clone()),
+                            None => return Err(Error::new("Struct has no such field"))
+                        };
+                    } else {
+                        return Err(Error::new("Field access on non struct type"));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1202,7 +1446,7 @@ impl InferenceSystem {
         self.equations.push(TypeEquation{lhs, rhs});
     }
 
-    fn add_types(graph: &mut Graph, return_type: Type, return_object: ObjectHandle) -> Result<()> {
+    async fn add_types(graph: &mut Graph, prog: Arc<Program>, return_type: Type, return_object: ObjectHandle) -> Result<()> {
         let mut is = InferenceSystem{equations: Vec::new()};
         is.add_eqn(TypeExpression::Placeholder(return_object), TypeExpression::Type(return_type.clone()));
         for block_handle in graph.blocks() {
@@ -1242,6 +1486,9 @@ impl InferenceSystem {
                     InstructionType::Return{src} => {
                         is.add_eqn(TypeExpression::Placeholder(src), TypeExpression::Type(return_type.clone()));
                     },
+                    InstructionType::StructFieldAssignment{ref parent_object, ref field, ref value} => {
+                        is.add_eqn(TypeExpression::Placeholder(*value), TypeExpression::StructField(*parent_object, field.clone()));
+                    },
                 }
             }
 
@@ -1258,18 +1505,23 @@ impl InferenceSystem {
                 }
             }
         }
-        is.results(graph)?;
+        is.results(graph, prog).await?;
         Ok(())
     }
 
-    fn results(&mut self, graph: &mut Graph) -> Result<()> {
-        while self.can_progress() {
+    async fn results(&mut self, graph: &mut Graph, prog: Arc<Program>) -> Result<()> {
+        loop {
+            dbg!(&self.equations);
             self.delete_tautologies();
             self.decompose();
             self.check_conflict()?;
             self.swap();
-            self.eliminate(graph);
+            self.eliminate(graph, prog.clone()).await?;
             self.check()?;
+
+            if !self.can_progress() {
+                break;
+            }
         }
         Self::fill_in_nevers(graph);
         Ok(())
@@ -1345,7 +1597,7 @@ impl InferenceSystem {
         }
     }
 
-    fn eliminate(&mut self, graph: &mut Graph) {
+    async fn eliminate(&mut self, graph: &mut Graph, prog: Arc<Program>) -> Result<()>{
         let mut to_remove = Vec::new();
         for (idx, eqn) in self.equations.iter().enumerate() {
             match (&eqn.lhs, &eqn.rhs) {
@@ -1365,9 +1617,11 @@ impl InferenceSystem {
         }
 
         for eqn in &mut self.equations {
-            eqn.lhs.do_substitutions(graph);
-            eqn.rhs.do_substitutions(graph);
+            eqn.lhs.do_substitutions(graph, prog.clone()).await?;
+            eqn.rhs.do_substitutions(graph, prog.clone()).await?;
         }
+
+        Ok(())
     }
 
     fn check(&self) -> Result<()> {
@@ -1392,6 +1646,7 @@ impl InferenceSystem {
         for eqn in &self.equations {
             match (&eqn.lhs, &eqn.rhs) {
                 (TypeExpression::Placeholder(_), TypeExpression::Placeholder(_)) => {},
+                (TypeExpression::Placeholder(_), TypeExpression::StructField(_, _)) => {},
                 _ => return true,
             }
         }
@@ -1414,12 +1669,7 @@ impl Query for GetFunctionAst {
 
 impl GetFunctionAst {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
-        let global_items_arc = make_query!(&prog, GetGlobalItems).await;
-        if global_items_arc.is_err() {
-            return Err(global_items_arc.as_ref().as_ref().unwrap_err().clone());
-        }
-
-        let global_items = global_items_arc.as_ref().as_ref().unwrap();
+        let global_items = make_query!(&prog, GetGlobalItems).await?;
 
         let item = global_items.get(&self.path).ok_or(
             Error::new("Could not find function")
@@ -1443,12 +1693,7 @@ impl Query for GetFunctionSignature {
 
 impl GetFunctionSignature {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
-        let global_items_arc = make_query!(&prog, GetGlobalItems).await;
-        if global_items_arc.is_err() {
-            return Err(global_items_arc.as_ref().as_ref().unwrap_err().clone());
-        }
-
-        let global_items = global_items_arc.as_ref().as_ref().unwrap();
+        let global_items = make_query!(&prog, GetGlobalItems).await?;
 
         let item = global_items.get(&self.path).ok_or(
             Error::new("Could not find function")
@@ -1476,25 +1721,9 @@ impl GetFunctionGraph {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
         let function_signature_fut = make_query!(&prog, GetFunctionSignature{path: self.path.clone()});
         let function_ast_fut = make_query!(&prog, GetFunctionAst{path: self.path.clone()});
-        let global_items_fut = make_query!(&prog, GetGlobalItems);
 
-        let (function_signature_arc, function_ast_arc, global_items_arc) = join!(function_signature_fut, function_ast_fut, global_items_fut);
+        let (function_signature, function_ast) = try_join!(function_signature_fut, function_ast_fut)?;
 
-        if function_signature_arc.is_err() {
-            return Err(function_signature_arc.as_ref().as_ref().unwrap_err().clone());
-        }
-        let function_signature = function_signature_arc.as_ref().as_ref().unwrap();
-
-        if function_ast_arc.is_err() {
-            return Err(function_ast_arc.as_ref().as_ref().unwrap_err().clone());
-        }
-
-        if global_items_arc.is_err() {
-            return Err(global_items_arc.as_ref().as_ref().unwrap_err().clone());
-        }
-        let global_items = global_items_arc.as_ref().as_ref().unwrap();
-
-        let function_ast = function_ast_arc.as_ref().as_ref().unwrap();
-        Graph::from_function_ast(function_ast, function_signature.clone(), global_items)
+        Graph::from_function_ast(&function_ast, function_signature.as_ref().clone(), prog.clone()).await
     }
 }
