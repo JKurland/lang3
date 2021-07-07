@@ -56,6 +56,11 @@ enum FunctionAstType {
         ident: String,
         value: Box<FunctionAst>,
     },
+    StructFieldAssign {
+        ident: String,
+        field_spec: Vec<String>,
+        value: Box<FunctionAst>,
+    },
     Add {
         lhs: Box<FunctionAst>,
         rhs: Box<FunctionAst>,
@@ -98,6 +103,22 @@ pub(crate) struct FunctionAst {
     
 }
 
+// returns None if tokens doesn't start with an assign, otherwise returns Some(len)
+// where len is the number of tokens on the rhs of the equal +1 for the equal
+fn starts_with_assign(tokens: &[Token]) -> Option<usize> {
+    for (idx, token) in tokens.iter().enumerate() {
+        match token.t {
+            TokenType::Equal => {
+                return Some(idx + 1);
+            },
+            TokenType::Ident(_) => {},
+            TokenType::Dot => {},
+            _ => {return None;}
+        }
+    }
+    return None;
+}
+
 fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
     #[derive(Debug)]
     enum State {
@@ -125,25 +146,21 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
         let new_state = match state {
             State::NewItem => {
                 item_start_idx = idx;
-                match token.t {
-                    TokenType::EOF => state,
-                    TokenType::If => State::IfSignature,
-                    TokenType::Loop => State::LoopSignature,
-                    TokenType::OpenBrace => State::Body(FunctionItemType::Scope),
-                    TokenType::Return => State::Return,
-                    TokenType::Let => State::LetBeforeEq,
-                    TokenType::Break => State::Break,
-                    TokenType::Ident(_) => {
-                        if let Some(next) = token_stream.get(idx + 1) {
-                            match next.t {
-                                TokenType::Equal => State::Skip(1, Box::new(State::Assign)),
-                                _ => State::Expr,
-                            }
-                        } else {
-                            State::Expr
-                        }
-                    },
-                    _ => State::Expr,
+
+                if let Some(to_skip) = starts_with_assign(&token_stream[idx..]) {
+                    State::Skip(to_skip, Box::new(State::Assign))
+                } else {
+                    match token.t {
+                        TokenType::EOF => state,
+                        TokenType::If => State::IfSignature,
+                        TokenType::Loop => State::LoopSignature,
+                        TokenType::OpenBrace => State::Body(FunctionItemType::Scope),
+                        TokenType::Return => State::Return,
+                        TokenType::Let => State::LetBeforeEq,
+                        TokenType::Break => State::Break,
+                        TokenType::Ident(_) => State::Expr,
+                        _ => State::Expr,
+                    }
                 }
             },
             State::IfSignature => {
@@ -359,15 +376,73 @@ fn parse_let(token_stream: &[Token]) -> Result<FunctionAst> {
 }
 
 fn parse_assign(token_stream: &[Token]) -> Result<FunctionAst> {
-    let ident = match token_stream.get(0).unwrap().t {
-        TokenType::Ident(ref s) => s.clone(),
-        _ => panic!("Found invalid assign item"),
-    };
+    let equal_pos = token_stream.iter().position(|t| t.t == TokenType::Equal).expect("Got invalid assign, no =");
+    let rhs = &token_stream[..equal_pos];
 
-    assert_eq!(token_stream.get(1), Some(&Token{t: TokenType::Equal}));
-    Ok(FunctionAst {
-        t: FunctionAstType::Assign{ident, value: Box::new(parse_expr(&token_stream[2..])?)}
-    })
+    #[derive(PartialEq)]
+    enum State {
+        ExpectingFirstIdent,
+        ExpectingIdent,
+        AfterIdent,
+    }
+
+    let mut state = State::ExpectingFirstIdent;
+    let mut ident = None;
+    let mut field_spec = Vec::new();
+    for token in rhs {
+        let new_state = match state {
+            State::ExpectingFirstIdent => {
+                match token.t {
+                    TokenType::Ident(ref s) => {
+                        ident = Some(s.clone());
+                        State::AfterIdent
+                    },
+                    _ => return Err(Error::new("Expecting ident"))
+                }
+            },
+            State::ExpectingIdent => {
+                match token.t {
+                    TokenType::Ident(ref s) => {
+                        field_spec.push(s.clone());
+                        State::AfterIdent
+                    },
+                    _ => return Err(Error::new("Expecting ident"))
+                }
+            },
+            State::AfterIdent => {
+                match token.t {
+                    TokenType::Dot => State::ExpectingIdent,
+                    _ => return Err(Error::new("Expecting . or ="))
+                }
+            }
+        };
+        state = new_state;
+    }
+
+    if state != State::AfterIdent {
+        return Err(Error::new("Expecting ident"));
+    }
+
+    if let None = ident {
+        panic!("No idents in AfterIdent state");
+    }
+
+    if field_spec.is_empty() {
+        Ok(FunctionAst {
+            t: FunctionAstType::Assign{
+                ident: ident.unwrap(),
+                value: Box::new(parse_expr(&token_stream[equal_pos+1..])?)
+            }
+        })
+    } else {
+        Ok(FunctionAst {
+            t: FunctionAstType::StructFieldAssign{
+                ident: ident.unwrap(),
+                field_spec: field_spec,
+                value: Box::new(parse_expr(&token_stream[equal_pos+1..])?)
+            }
+        })
+    }
 }
 
 fn parse_if(token_stream: &[Token]) -> Result<FunctionAst> {
@@ -806,7 +881,7 @@ pub(crate) enum InstructionType {
     },
     StructFieldAssignment{
         parent_object: ObjectHandle,
-        field: String,
+        field_spec: Vec<String>,
         value: ObjectHandle,
     },
     StructFieldAccess{
@@ -1271,7 +1346,7 @@ impl Graph {
                                                     let block = self.block_mut(cur_block);
                                                     block.instructions.push(Instruction{t: InstructionType::StructFieldAssignment{
                                                         parent_object: obj,
-                                                        field: field_name.clone(),
+                                                        field_spec: vec![field_name.clone()],
                                                         value: value_object,
                                                     }});
                                                 }
@@ -1404,6 +1479,24 @@ impl Graph {
                     let var_obj = self.get_name(&ident)?;
                     self.evaluate_and_store(&*value, current_block, Some(var_obj), ctx).await
                 },
+                FunctionAstType::StructFieldAssign{ref ident, ref field_spec, ref value} => {
+                    if let Some(obj) = object_handle {
+                        self.block_mut(current_block).instructions.push(Instruction{t: InstructionType::StoreNull(obj)});
+                    }
+
+                    let eval_obj = self.new_object(ObjectSource::Local);
+                    let cur_block = unwrap_block(self.evaluate_and_store(&*value, current_block, Some(eval_obj), ctx).await?)?;
+                    
+                    let var_obj = self.get_name(ident)?;
+                    self.block_mut(cur_block).instructions.push(Instruction{
+                        t: InstructionType::StructFieldAssignment{
+                            parent_object: var_obj,
+                            field_spec: field_spec.clone(),
+                            value: eval_obj,
+                        }
+                    });
+                    Ok(Some(cur_block))
+                },
             }
         }.boxed()
     }
@@ -1452,7 +1545,7 @@ impl Type {
 enum TypeExpression {
     Type(Type),
     Placeholder(ObjectHandle),
-    StructField(ObjectHandle, String),
+    StructField(ObjectHandle, Vec<String>),
 }
 
 impl TypeExpression {
@@ -1476,18 +1569,26 @@ impl TypeExpression {
                 }
                 Ok(())
             },
-            TypeExpression::StructField(parent, field) => {
-                if let Some(ref parent_type) = graph.object(*parent).t {
-                    if let Type::Struct(ref item_path) = parent_type {
-                        let s = make_query!(prog, GetStruct{path: item_path.clone()}).await?;
-                        *self = match s.get_member(field) {
-                            Some(t) => TypeExpression::Type(t.clone()),
-                            None => return Err(Error::new("Struct has no such field"))
-                        };
-                    } else {
-                        return Err(Error::new("Field access on non struct type"));
+            TypeExpression::StructField(first_parent, field_spec) => {
+                if let Some(first_parent_type) = graph.object(*first_parent).t.clone() {
+                    let mut parent_type = first_parent_type;
+
+                    for field in field_spec {
+                        if let Type::Struct(ref item_path) = parent_type {
+                            let s = make_query!(prog, GetStruct{path: item_path.clone()}).await?;
+
+                            parent_type = match s.get_member(field) {
+                                Some(t) => t.clone(),
+                                None => return Err(Error::new("Struct has no such field"))
+                            };
+
+                        } else {
+                            return Err(Error::new("Field access on non struct type"));
+                        }
                     }
+                    *self = TypeExpression::Type(parent_type);
                 }
+
                 Ok(())
             }
         }
@@ -1550,11 +1651,11 @@ impl InferenceSystem {
                     InstructionType::Return{src} => {
                         is.add_eqn(TypeExpression::Placeholder(src), TypeExpression::Type(return_type.clone()));
                     },
-                    InstructionType::StructFieldAssignment{ref parent_object, ref field, ref value} => {
-                        is.add_eqn(TypeExpression::Placeholder(*value), TypeExpression::StructField(*parent_object, field.clone()));
+                    InstructionType::StructFieldAssignment{ref parent_object, ref field_spec, ref value} => {
+                        is.add_eqn(TypeExpression::Placeholder(*value), TypeExpression::StructField(*parent_object, field_spec.clone()));
                     },
                     InstructionType::StructFieldAccess{ref parent_object, ref field, ref dest} => {
-                        is.add_eqn(TypeExpression::Placeholder(*dest), TypeExpression::StructField(*parent_object, field.clone()));
+                        is.add_eqn(TypeExpression::Placeholder(*dest), TypeExpression::StructField(*parent_object, vec![field.clone()]));
                     },
                 }
             }
@@ -1787,9 +1888,8 @@ impl GetFunctionGraph {
     pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
         let function_signature_fut = make_query!(&prog, GetFunctionSignature{path: self.path.clone()});
         let function_ast_fut = make_query!(&prog, GetFunctionAst{path: self.path.clone()});
-
+    
         let (function_signature, function_ast) = try_join!(function_signature_fut, function_ast_fut)?;
-
         Graph::from_function_ast(&function_ast, function_signature.as_ref().clone(), prog.clone()).await
     }
 }

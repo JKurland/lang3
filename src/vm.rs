@@ -10,7 +10,7 @@ use crate::{Result, make_query};
 use crate::function;
 use crate::storage::Storage;
 use crate::Program;
-use crate::structs::GetStruct;
+use crate::structs::{GetStruct, Struct};
 
 #[derive(Clone, Copy)]
 struct SendPtr<T> {
@@ -125,8 +125,7 @@ fn align<'a, 'b: 'a, 'c: 'a>(t: &'b Type, prog: &'c Arc<Program>) -> BoxFuture<'
     }.boxed()
 }
 
-async fn field_offset(struct_path: &ItemPath, prog: Arc<Program>, field_name: &str) -> Result<usize> {
-    let struct_ = make_query!(prog, GetStruct{path: struct_path.clone()}).await?;
+async fn struct_field_offset(struct_: &Arc<Struct>, prog: &Arc<Program>, field_name: &str) -> Result<usize> {
     let member_idx = struct_.member_idx(field_name).unwrap();
     let mut s = 0;
     for t in struct_.member_types().take(member_idx) {
@@ -135,6 +134,34 @@ async fn field_offset(struct_path: &ItemPath, prog: Arc<Program>, field_name: &s
     }
     s = align_up_to(s, align(struct_.get_member(field_name).unwrap(), &prog).await?);
     Ok(s)
+}
+
+async fn field_offset(struct_path: &ItemPath, prog: Arc<Program>, field_name: &str) -> Result<usize> {
+    let struct_ = make_query!(prog, GetStruct{path: struct_path.clone()}).await?;
+    struct_field_offset(&struct_, &prog, field_name).await
+}
+
+async fn field_spec_offset(struct_path: &ItemPath, prog: Arc<Program>, field_spec: &[String]) -> Result<usize> {
+    let mut offset = 0;
+
+    let mut struct_ = make_query!(prog, GetStruct{path: struct_path.clone()}).await?;
+    for field_name in field_spec.iter().take(field_spec.len() - 1) {
+
+        offset += struct_field_offset(&struct_, &prog, field_name).await?;
+
+        let next_struct_type = struct_.get_member(field_name).unwrap();
+        if let Type::Struct(next_item_path) = next_struct_type {
+            struct_ = make_query!(prog, GetStruct{path: next_item_path.clone()}).await?;
+        } else {
+            panic!("Field access on non struct in vm");
+        }
+    }
+
+    if let Some(last_field) = field_spec.last() {
+        offset += struct_field_offset(&struct_, &prog, last_field).await?;
+    }
+
+    Ok(offset)
 }
 
 fn align_up_to(x: usize, align: usize) -> usize {
@@ -665,15 +692,18 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
                         dst: MoveArg::ReturnValue,
                     });
                 },
-                InstructionType::StructFieldAssignment{ref parent_object, ref field, ref value} => {
+                InstructionType::StructFieldAssignment{ref parent_object, ref field_spec, ref value} => {
                     let parent_type = graph.object(*parent_object).t.as_ref().unwrap();
                     if let Type::Struct(path) = parent_type {
                         instructions.push(Instruction{
                             src: move_arg_for(*value).await?,
-                            dst: offset_move_arg_for(*parent_object, field_offset(&path, prog.clone(), field).await?).await?
+                            dst: offset_move_arg_for(*parent_object, field_spec_offset(&path, prog.clone(), field_spec).await?).await?
                         });
                     } else {
-                        panic!("Field assignment on non struct");
+                        instructions.push(Instruction{
+                            src: move_arg_for(*value).await?,
+                            dst: move_arg_for(*parent_object).await?,
+                        });
                     }
                 },
                 InstructionType::StructFieldAccess{ref parent_object, ref field, ref dest} => {

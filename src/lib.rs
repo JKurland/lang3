@@ -480,4 +480,19 @@ mod tests {
             }"#
         ), Ok(4));
     }
+
+    #[test]
+    fn test_struct_field_assign() {
+        assert_eq!(run_main(r#"
+            struct A {
+                x: u32
+            }
+
+            fn main() -> u32 {
+                let a = A{x: 3};
+                a.x = 4;
+                return a.x;
+            }"#
+        ), Ok(4));
+    }
 }

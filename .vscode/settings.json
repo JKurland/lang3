@@ -1,5 +1,11 @@
 {
     "files.exclude": {
         "/target": true
+    },
+    "files.watcherExclude": {
+        "/target": true
+    },
+    "search.exclude": {
+        "/target": true
     }
 }
