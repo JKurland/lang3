@@ -1,4 +1,4 @@
-use crate::inference::{InferenceSystem, Type};
+use crate::inference::{InferenceSystem, Type, TypeExpression};
 use crate::itemise::{self, GetGlobalItems, ItemPath, ItemType};
 use crate::lex::{Token, TokenType};
 use crate::{Result, Error, Query, Program, make_query};
@@ -1113,7 +1113,7 @@ impl Graph {
             }
         }
 
-        InferenceSystem::add_types(&mut graph, prog.clone(), return_type, return_object).await?;
+        add_types(&mut graph, prog.clone(), return_type, return_object).await?;
         for handle in graph.objects() {
             let object = graph.object(handle);
             if object.t.is_none() {
@@ -1505,6 +1505,74 @@ impl Graph {
 
 
 
+
+
+
+async fn add_types(graph: &mut Graph, prog: Arc<Program>, return_type: Type, return_object: ObjectHandle) -> Result<()> {
+    let mut is = InferenceSystem::new();
+    is.add_eqn(TypeExpression::Placeholder(return_object), TypeExpression::Type(return_type.clone()));
+    for block_handle in graph.blocks() {
+        let block = graph.block(block_handle);
+        for inst in &block.instructions {
+            match inst.t {
+                InstructionType::Eq{dest, lhs, rhs} => {
+                    is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::Bool));
+                    is.add_eqn(TypeExpression::Placeholder(lhs), TypeExpression::Placeholder(rhs));
+                },
+                InstructionType::StoreU32(dest, _) => {
+                    is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::U32));
+                },
+                InstructionType::StoreString(dest, _) => {
+                    is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::String));
+                },
+                InstructionType::StoreNull(dest) => {
+                    is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::Null));
+                },
+                InstructionType::SetType(ref obj, ref t) => {
+                    is.add_eqn(TypeExpression::Placeholder(*obj), TypeExpression::Type(t.clone()));
+                },
+                InstructionType::Add{dest, lhs, rhs} => {
+                    is.add_eqn(TypeExpression::Placeholder(lhs), TypeExpression::Type(Type::U32));
+                    is.add_eqn(TypeExpression::Placeholder(rhs), TypeExpression::Type(Type::U32));
+                    is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::U32));
+                },
+                InstructionType::Copy{src, dst} => {
+                    is.add_eqn(TypeExpression::Placeholder(src), TypeExpression::Placeholder(dst));
+                },
+                InstructionType::Call{ref dst, callee: _, ref signature, ref args} => {
+                    is.add_eqn(TypeExpression::Placeholder(*dst), TypeExpression::Type(signature.return_type.clone()));
+                    for (arg, sig) in args.iter().zip(&signature.args) {
+                        is.add_eqn(TypeExpression::Placeholder(*arg), TypeExpression::Type(sig.1.clone()));
+                    }
+                },
+                InstructionType::Return{src} => {
+                    is.add_eqn(TypeExpression::Placeholder(src), TypeExpression::Type(return_type.clone()));
+                },
+                InstructionType::StructFieldAssignment{ref parent_object, ref field_spec, ref value} => {
+                    is.add_eqn(TypeExpression::Placeholder(*value), TypeExpression::StructField(*parent_object, field_spec.clone()));
+                },
+                InstructionType::StructFieldAccess{ref parent_object, ref field, ref dest} => {
+                    is.add_eqn(TypeExpression::Placeholder(*dest), TypeExpression::StructField(*parent_object, vec![field.clone()]));
+                },
+            }
+        }
+
+        match &block.jump {
+            None => {},
+            Some(j) => {
+                match j.t {
+                    JumpType::Return => {},
+                    JumpType::Cond{condition, ..} => {
+                        is.add_eqn(TypeExpression::Placeholder(condition), TypeExpression::Type(Type::Bool));
+                    },
+                    JumpType::Uncond(..) => {},
+                }
+            }
+        }
+    }
+    is.results(graph, prog).await?;
+    Ok(())
+}
 
 
 

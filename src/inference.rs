@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::storage::Storage;
 use crate::structs::GetStruct;
 use crate::{Result, Error, Program, make_query};
-use crate::function::{Graph, InstructionType, JumpType, ObjectHandle};
+use crate::function::{Graph, ObjectHandle};
 use crate::itemise::ItemPath;
 
 
@@ -44,7 +44,7 @@ impl Type {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-enum TypeExpression {
+pub(crate) enum TypeExpression {
     Type(Type),
     Placeholder(ObjectHandle),
     StructField(ObjectHandle, Vec<String>),
@@ -109,77 +109,17 @@ pub(crate) struct InferenceSystem {
 }
 
 impl InferenceSystem {
-    fn add_eqn(&mut self, lhs: TypeExpression, rhs: TypeExpression) {
+    pub(crate) fn new() -> Self {
+        Self {
+            equations: Vec::new()
+        }
+    }
+
+    pub(crate) fn add_eqn(&mut self, lhs: TypeExpression, rhs: TypeExpression) {
         self.equations.push(TypeEquation{lhs, rhs});
     }
 
-    pub(crate) async fn add_types(graph: &mut Graph, prog: Arc<Program>, return_type: Type, return_object: ObjectHandle) -> Result<()> {
-        let mut is = InferenceSystem{equations: Vec::new()};
-        is.add_eqn(TypeExpression::Placeholder(return_object), TypeExpression::Type(return_type.clone()));
-        for block_handle in graph.blocks() {
-            let block = graph.block(block_handle);
-            for inst in &block.instructions {
-                match inst.t {
-                    InstructionType::Eq{dest, lhs, rhs} => {
-                        is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::Bool));
-                        is.add_eqn(TypeExpression::Placeholder(lhs), TypeExpression::Placeholder(rhs));
-                    },
-                    InstructionType::StoreU32(dest, _) => {
-                        is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::U32));
-                    },
-                    InstructionType::StoreString(dest, _) => {
-                        is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::String));
-                    },
-                    InstructionType::StoreNull(dest) => {
-                        is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::Null));
-                    },
-                    InstructionType::SetType(ref obj, ref t) => {
-                        is.add_eqn(TypeExpression::Placeholder(*obj), TypeExpression::Type(t.clone()));
-                    },
-                    InstructionType::Add{dest, lhs, rhs} => {
-                        is.add_eqn(TypeExpression::Placeholder(lhs), TypeExpression::Type(Type::U32));
-                        is.add_eqn(TypeExpression::Placeholder(rhs), TypeExpression::Type(Type::U32));
-                        is.add_eqn(TypeExpression::Placeholder(dest), TypeExpression::Type(Type::U32));
-                    },
-                    InstructionType::Copy{src, dst} => {
-                        is.add_eqn(TypeExpression::Placeholder(src), TypeExpression::Placeholder(dst));
-                    },
-                    InstructionType::Call{ref dst, callee: _, ref signature, ref args} => {
-                        is.add_eqn(TypeExpression::Placeholder(*dst), TypeExpression::Type(signature.return_type.clone()));
-                        for (arg, sig) in args.iter().zip(&signature.args) {
-                            is.add_eqn(TypeExpression::Placeholder(*arg), TypeExpression::Type(sig.1.clone()));
-                        }
-                    },
-                    InstructionType::Return{src} => {
-                        is.add_eqn(TypeExpression::Placeholder(src), TypeExpression::Type(return_type.clone()));
-                    },
-                    InstructionType::StructFieldAssignment{ref parent_object, ref field_spec, ref value} => {
-                        is.add_eqn(TypeExpression::Placeholder(*value), TypeExpression::StructField(*parent_object, field_spec.clone()));
-                    },
-                    InstructionType::StructFieldAccess{ref parent_object, ref field, ref dest} => {
-                        is.add_eqn(TypeExpression::Placeholder(*dest), TypeExpression::StructField(*parent_object, vec![field.clone()]));
-                    },
-                }
-            }
-
-            match &block.jump {
-                None => {},
-                Some(j) => {
-                    match j.t {
-                        JumpType::Return => {},
-                        JumpType::Cond{condition, ..} => {
-                            is.add_eqn(TypeExpression::Placeholder(condition), TypeExpression::Type(Type::Bool));
-                        },
-                        JumpType::Uncond(..) => {},
-                    }
-                }
-            }
-        }
-        is.results(graph, prog).await?;
-        Ok(())
-    }
-
-    async fn results(&mut self, graph: &mut Graph, prog: Arc<Program>) -> Result<()> {
+    pub(crate) async fn results(&mut self, graph: &mut Graph, prog: Arc<Program>) -> Result<()> {
         loop {
             self.delete_tautologies();
             self.decompose();
