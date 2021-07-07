@@ -2,7 +2,7 @@ use crate::{lex::{Token, TokenType, GetTokenStream}, make_query};
 use std::collections::HashMap;
 use crate::{Result, Error, Query, Program};
 use std::sync::Arc;
-use crate::function::Type;
+use crate::inference::Type;
 
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct ItemPath {

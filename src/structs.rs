@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::function::Type;
+use crate::inference::Type;
 use crate::lex::{Token, TokenType};
 use crate::{Error, Program, Query, Result, make_query};
 use crate::itemise::{GetGlobalItems, ItemPath, ItemType};

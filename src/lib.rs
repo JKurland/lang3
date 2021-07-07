@@ -15,6 +15,7 @@ use std::fmt;
 pub(crate) mod lex;
 pub(crate) mod itemise;
 pub(crate) mod function;
+pub(crate) mod inference;
 pub(crate) mod vm;
 pub(crate) mod storage;
 pub(crate) mod structs;

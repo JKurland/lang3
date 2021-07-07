@@ -1,4 +1,4 @@
-use function::Type;
+use crate::inference::Type;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 
