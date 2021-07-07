@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use futures::future::{BoxFuture, FutureExt};
 use futures::try_join;
 use itemise::FunctionSignature;
-use crate::storage::Handle;
+use crate::storage::{Handle, Storage};
 use crate::structs::GetStruct;
 
 // AST
@@ -1601,7 +1601,7 @@ struct TypeEquation {
     rhs: TypeExpression,
 }
 
-
+#[derive(Debug)]
 struct InferenceSystem {
     equations: Vec<TypeEquation>,
 }
@@ -1766,13 +1766,17 @@ impl InferenceSystem {
 
     async fn eliminate(&mut self, graph: &mut Graph, prog: Arc<Program>) -> Result<()>{
         let mut to_remove = Vec::new();
+        let mut objects_already_removed = Storage::new();
         for (idx, eqn) in self.equations.iter().enumerate() {
             match (&eqn.lhs, &eqn.rhs) {
                 (TypeExpression::Placeholder(_), TypeExpression::Placeholder(_)) => {},
                 (TypeExpression::Placeholder(obj), TypeExpression::Type(rhs)) => {
                     if !rhs.depends_on(*obj) {
-                        to_remove.push(idx);
-                        graph.object_mut(*obj).t = Some(rhs.clone());
+                        if let None = objects_already_removed.get(obj) {
+                            *objects_already_removed.get_mut(obj) = Some(());
+                            to_remove.push(idx);
+                            graph.object_mut(*obj).t = Some(rhs.clone());
+                        }
                     }
                 },
                 _ => {}

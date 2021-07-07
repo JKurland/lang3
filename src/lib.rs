@@ -187,7 +187,7 @@ mod tests {
         let program = block_on(make_query!(&prog, GetFunctionVmProgram{
             path: ItemPath::new("main"),
         }))?;
-
+        //dbg!(&program);
         let mut vm = vm::Vm::new(8092);
         Ok(vm.run(&program) as u32)
     }
@@ -494,5 +494,43 @@ mod tests {
                 return a.x;
             }"#
         ), Ok(4));
+    }
+
+    #[test]
+    fn test_nested_struct_assignment() {
+        assert_eq!(run_main(r#"
+            struct A {
+                x: u32
+            }
+
+            struct S {
+                a: A,
+                a2: A,
+            }
+
+            fn main() -> u32 {
+                let s = S{a: A{x: 1}, a2: A{x: 3}};
+                s.a.x = 20;
+                return s.a.x + s.a2.x;
+            }"#
+        ), Ok(23));
+    }
+
+    #[test]
+    fn test_struct_function_argument() {
+        assert_eq!(run_main(r#"
+            fn f(a: A) -> u32 {
+                return a.x + 1;
+            }
+
+            struct A {
+                x: u32
+            }
+
+            fn main() -> u32 {
+                let a = A{x: 10};
+                return f(a);
+            }"#
+        ), Ok(11));
     }
 }

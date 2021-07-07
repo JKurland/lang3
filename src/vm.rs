@@ -168,7 +168,7 @@ fn align_up_to(x: usize, align: usize) -> usize {
     x + ((align - (x % align)) % align)
 }
 
-async fn offsets<'a, T: Iterator<Item = &'a Type> + 'a>(types: T, initial: usize, prog: Arc<Program>) -> Result<Vec<usize>> {
+async fn layout<'a, T: Iterator<Item = &'a Type> + 'a>(types: T, initial: usize, prog: Arc<Program>) -> Result<(Vec<usize>, usize)> {
     let mut total = initial;
     let mut rtn = Vec::new();
     for t in types {
@@ -176,7 +176,7 @@ async fn offsets<'a, T: Iterator<Item = &'a Type> + 'a>(types: T, initial: usize
         rtn.push(total);
         total += size(t, &prog).await?;
     }
-    Ok(rtn)
+    Ok((rtn, total))
 }
 
 #[derive(Debug)]
@@ -481,22 +481,21 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
             graph.object(handle).t.as_ref().unwrap()
         }); 
 
-        let mut total = 0;
-        for (arg, offset) in args.iter().zip(offsets(arg_types, 0, prog.clone()).await?) {
+        let (offsets, args_size) = layout(arg_types, 0, prog.clone()).await?;
+        for (arg, offset) in args.iter().zip(offsets) {
             let handle = arg.expect("Missing arg index");
             *stack_offsets.get_mut(&handle) = Some(offset);
-            total = offset;
         } 
 
         let local_types = locals.iter().map(|handle| {
             graph.object(*handle).t.as_ref().unwrap()
         });
 
-        for (handle, offset) in locals.iter().zip(offsets(local_types, total, prog.clone()).await?) {
+        let (offsets, total) = layout(local_types, args_size, prog.clone()).await?;
+        for (handle, offset) in locals.iter().zip(offsets) {
             *stack_offsets.get_mut(handle) = Some(offset);
-            total = offset;
         } 
-        
+
         (stack_offsets, total)
     };
 
@@ -607,8 +606,7 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
                 },
                 InstructionType::Call{ref dst, ref callee, ref signature, ref args} => {
                     dependencies.push(callee.clone());
-
-                    let arg_offsets = offsets(signature.args.iter().map(|a|&a.1), 0, prog.clone()).await?;
+                    let (arg_offsets, _) = layout(signature.args.iter().map(|a|&a.1), 0, prog.clone()).await?;
                     for (arg, offset) in args.iter().zip(arg_offsets) {
                         instructions.push(Instruction{
                             src: move_arg_for(*arg).await?,
