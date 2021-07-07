@@ -533,4 +533,43 @@ mod tests {
             }"#
         ), Ok(11));
     }
+
+    #[test]
+    fn test_bad_return_type_error() {
+        assert_eq!(run_main(r#"
+            fn f() {
+                return 1;
+            }
+
+            fn main() -> u32 {
+                f(a);
+                return 2;
+            }"#
+        ).is_err(), true);
+    }
+
+    #[test]
+    fn test_bad_return_type_error2() {
+        assert_eq!(run_main(r#"
+            fn f() -> u32{
+                return 1 == 3;
+            }
+
+            fn main() -> u32 {
+                f(a);
+                return 2;
+            }"#
+        ).is_err(), true);
+    }
+
+    #[test]
+    fn test_bad_assign_type_error() {
+        assert_eq!(run_main(r#"
+            fn main() -> u32 {
+                let a = 2;
+                a = 3 == 4;
+                return 2;
+            }"#
+        ).is_err(), true);
+    }
 }
