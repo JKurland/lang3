@@ -461,11 +461,10 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
         let mut locals = vec![];
 
         for handle in graph.objects() {
-            let object = graph.object(handle);
-            match object.source {
+            match graph.get_source(handle) {
                 function::ObjectSource::Argument(idx) => {
                     args.resize(idx + 1, None);
-                    args[idx] = Some(handle);
+                    args[*idx] = Some(handle);
                 },
                 function::ObjectSource::Local => {
                     locals.push(handle);
@@ -476,7 +475,7 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
         let mut stack_offsets = Storage::new();
         let arg_types = args.iter().map(|arg| {
             let handle = arg.expect("Missing arg index");
-            graph.object(handle).t.as_ref().unwrap()
+            graph.get_type(handle)
         }); 
 
         let (offsets, args_size) = layout(arg_types, 0, prog.clone()).await?;
@@ -486,7 +485,7 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
         } 
 
         let local_types = locals.iter().map(|handle| {
-            graph.object(*handle).t.as_ref().unwrap()
+            graph.get_type(*handle)
         });
 
         let (offsets, total) = layout(local_types, args_size, prog.clone()).await?;
@@ -506,7 +505,7 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
             unsafe {
                 Ok(MoveArg::Stack{
                     offset: *(*sop.deref()).get(&o).unwrap() as i64,
-                    len: size((*gp.deref()).object(o).t.as_ref().unwrap(), &*pp.deref()).await? as u64
+                    len: size((*gp.deref()).get_type(o), &*pp.deref()).await? as u64
                 })
             }
         }
@@ -521,7 +520,7 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
             unsafe {
                 Ok(MoveArg::Stack{
                     offset: (*(*sop.deref()).get(&o).unwrap() + offset) as i64,
-                    len: size((*gp.deref()).object(o).t.as_ref().unwrap(), &*pp.deref()).await? as u64
+                    len: size((*gp.deref()).get_type(o), &*pp.deref()).await? as u64
                 })
             }
         }
@@ -610,7 +609,7 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
                             src: move_arg_for(*arg).await?,
                             dst: MoveArg::Stack{
                                 offset: offset as i64 + stack_size as i64,
-                                len: size(graph.object(*arg).t.as_ref().unwrap(), &prog).await? as u64,
+                                len: size(graph.get_type(*arg), &prog).await? as u64,
                             },
                         });
                     }
@@ -631,7 +630,7 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
                     });
 
                     instructions.push(Instruction{
-                        src: MoveArg::Word(size(graph.object(*dst).t.as_ref().unwrap(), &prog).await? as u64),
+                        src: MoveArg::Word(size(graph.get_type(*dst), &prog).await? as u64),
                         dst: MoveArg::ReturnValueLen,
                     });
 
@@ -689,7 +688,7 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
                     });
                 },
                 InstructionType::StructFieldAssignment{ref parent_object, ref field_spec, ref value} => {
-                    let parent_type = graph.object(*parent_object).t.as_ref().unwrap();
+                    let parent_type = graph.get_type(*parent_object);
                     if let Type::Struct(path) = parent_type {
                         instructions.push(Instruction{
                             src: move_arg_for(*value).await?,
@@ -703,7 +702,7 @@ async fn vm_program(graph: &function::Graph, vm_prog: &mut VmProgram, prog: Arc<
                     }
                 },
                 InstructionType::StructFieldAccess{ref parent_object, ref field, ref dest} => {
-                    let parent_type = graph.object(*parent_object).t.as_ref().unwrap();
+                    let parent_type = graph.get_type(*parent_object);
                     if let Type::Struct(path) = parent_type {
                         instructions.push(Instruction{
                             src: offset_move_arg_for(*parent_object, field_offset(&path, prog.clone(), field).await?).await?,

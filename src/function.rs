@@ -920,8 +920,8 @@ pub(crate) enum ObjectSource {
 
 #[derive(Debug)]
 pub(crate) struct Object {
-    pub(crate) t: Option<Type>,
-    pub(crate) source: ObjectSource,
+    t: Option<Type>,
+    source: ObjectSource,
 }
 
 #[derive(Debug)]
@@ -998,7 +998,7 @@ pub(crate) struct Graph {
     objects: Vec<Object>,
     blocks: Vec<Block>,
     names: Vec<HashMap<String, ObjectHandle>>,
-    pub(crate) never_objects: Vec<ObjectHandle>,
+    never_objects: Vec<ObjectHandle>,
 }
 
 #[derive(Clone)]
@@ -1085,6 +1085,13 @@ impl Graph {
         ObjectHandle(self.objects.len() - 1)
     }
 
+    pub(crate) fn get_type(&self, handle: ObjectHandle) -> &Type {
+        self.object(handle).t.as_ref().unwrap()
+    }
+
+    pub(crate) fn get_source(&self, handle: ObjectHandle) -> &ObjectSource {
+        &self.object(handle).source
+    }
 
     pub(crate) async fn from_function_ast(ast: &FunctionAst, signature: FunctionSignature, prog: Arc<Program>) -> Result<Self> {
         let return_type = signature.return_type;
