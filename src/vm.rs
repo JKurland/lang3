@@ -97,7 +97,6 @@ fn size<'a, 'b: 'a, 'c: 'a>(t: &'b Type, prog: &'c Arc<Program>) -> BoxFuture<'a
                 }
                 Ok(s)
             },
-            Type::Compound(_, _) => panic!("Compound not supported"),
         }
     }.boxed()
 }
@@ -120,7 +119,6 @@ fn align<'a, 'b: 'a, 'c: 'a>(t: &'b Type, prog: &'c Arc<Program>) -> BoxFuture<'
                     None => Ok(1),
                 }
             },
-            Type::Compound(_, _) => panic!("Compound not supported align"),
         }
     }.boxed()
 }

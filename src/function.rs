@@ -1570,7 +1570,10 @@ async fn add_types(graph: &mut Graph, prog: Arc<Program>, return_type: Type, ret
             }
         }
     }
-    is.results(graph, prog).await?;
+    let types = is.results(&graph.never_objects, prog).await?;
+    for obj in graph.objects() {
+        graph.object_mut(obj).t = types.get(&obj).cloned();
+    }
     Ok(())
 }
 
