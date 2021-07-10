@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{Result, SourceRef};
 use crate::Error;
 use crate::Query;
 use crate::Program;
@@ -34,8 +34,9 @@ pub enum TokenType {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Token {
-    pub t: TokenType
+pub(crate) struct Token {
+    pub t: TokenType,
+    pub source_ref: SourceRef,
 }
 
 trait Lexer {
@@ -177,6 +178,7 @@ pub(crate) fn lex(mut s: &str) -> Result<Vec<Token>> {
     ];
 
     let mut tokens: Vec<Token> = Vec::new();
+    let full_len = s.len();
     loop {
         s = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
         if s.is_empty() {
@@ -200,10 +202,15 @@ pub(crate) fn lex(mut s: &str) -> Result<Vec<Token>> {
         }
 
         let (token, remaining) = s.split_at(max_token_length);
+        let source_ref = SourceRef::new(full_len - s.len(), token.len());
+
         s = remaining;
         match matched_lexer {
             None => return Err(Error::UnknownToken),
-            Some(lexer) => tokens.push(Token{t: lexer.make_token(token)})
+            Some(lexer) => tokens.push(Token{
+                t: lexer.make_token(token),
+                source_ref,
+            })
         }
     }
     return Ok(tokens);
@@ -224,62 +231,65 @@ impl GetTokenStream {
 
 mod test {
     #[cfg(test)]
-    use crate::make_query;
-
-    #[cfg(test)]
     use super::*;
+    
+    #[cfg(test)]
+    fn lex_types(s: &str) -> Result<Vec<TokenType>> {
+        let mut rtn = Vec::new();
+        for token in lex(s)? {
+            rtn.push(token.t)
+        }
+        Ok(rtn)
+    }
+
 
     #[test]
     fn test_lex_keyword() {
-        assert_eq!(lex("loop"), Ok(vec![Token{t: TokenType::Loop}]));
-        assert_eq!(lex("if"), Ok(vec![Token{t: TokenType::If}]));
-        assert_eq!(lex("loop if"), Ok(vec![Token{t: TokenType::Loop}, Token{t: TokenType::If}]));
+        assert_eq!(lex_types("loop"), Ok(vec![TokenType::Loop]));
+        assert_eq!(lex_types("if"), Ok(vec![TokenType::If]));
+        assert_eq!(lex_types("loop if"), Ok(vec![TokenType::Loop, TokenType::If]));
     }
 
     #[test]
     fn test_lex_ident() {
-        assert_eq!(lex("hello"), Ok(vec![Token{t: TokenType::Ident("hello".to_string())}]));
-        assert_eq!(lex("hello "), Ok(vec![Token{t: TokenType::Ident("hello".to_string())}]));
-        assert_eq!(lex("hello goodbye"), Ok(vec![
-            Token{t: TokenType::Ident("hello".to_string())},
-            Token{t: TokenType::Ident("goodbye".to_string())}
+        assert_eq!(lex_types("hello"), Ok(vec![TokenType::Ident("hello".to_string())]));
+        assert_eq!(lex_types("hello "), Ok(vec![TokenType::Ident("hello".to_string())]));
+        assert_eq!(lex_types("hello goodbye"), Ok(vec![
+            TokenType::Ident("hello".to_string()),
+            TokenType::Ident("goodbye".to_string())
         ]));
     }
 
     #[test]
     fn test_lex_mixed() {
-        assert_eq!(lex("hello goodbye   123 if loop else 234,; dj23 \"h£ello\"_23\n43\n loophello\t72jsd +"), Ok(vec![
-            Token{t: TokenType::Ident("hello".to_string())},
-            Token{t: TokenType::Ident("goodbye".to_string())},
-            Token{t: TokenType::Int("123".to_string())},
-            Token{t: TokenType::If},
-            Token{t: TokenType::Loop},
-            Token{t: TokenType::Else},
-            Token{t: TokenType::Int("234".to_string())},
-            Token{t: TokenType::Comma},
-            Token{t: TokenType::SemiColon},
-            Token{t: TokenType::Ident("dj23".to_string())},
-            Token{t: TokenType::String("\"h£ello\"".to_string())},
-            Token{t: TokenType::Ident("_23".to_string())},
-            Token{t: TokenType::Int("43".to_string())},
-            Token{t: TokenType::Ident("loophello".to_string())},
-            Token{t: TokenType::Int("72".to_string())},
-            Token{t: TokenType::Ident("jsd".to_string())},
-            Token{t: TokenType::Plus},
+        assert_eq!(lex_types("hello goodbye   123 if loop else 234,; dj23 \"h£ello\"_23\n43\n loophello\t72jsd +"), Ok(vec![
+            TokenType::Ident("hello".to_string()),
+            TokenType::Ident("goodbye".to_string()),
+            TokenType::Int("123".to_string()),
+            TokenType::If,
+            TokenType::Loop,
+            TokenType::Else,
+            TokenType::Int("234".to_string()),
+            TokenType::Comma,
+            TokenType::SemiColon,
+            TokenType::Ident("dj23".to_string()),
+            TokenType::String("\"h£ello\"".to_string()),
+            TokenType::Ident("_23".to_string()),
+            TokenType::Int("43".to_string()),
+            TokenType::Ident("loophello".to_string()),
+            TokenType::Int("72".to_string()),
+            TokenType::Ident("jsd".to_string()),
+            TokenType::Plus,
         ]));
     }
 
-    #[cfg(test)]
-    use futures::executor::block_on;
     #[test]
-    fn test_as_query() {
-        let prog = Arc::new(Program::new("if a; b".to_string()));
-        let token_stream = block_on(make_query!(&prog, GetTokenStream)).unwrap();
-        assert_eq!(*token_stream, vec![
-            Token{t: TokenType::If},
-            Token{t: TokenType::Ident("a".to_string())},
-            Token{t: TokenType::SemiColon},
-            Token{t: TokenType::Ident("b".to_string())},
-        ]);
+    fn test_lex_source_ref() {
+        assert_eq!(lex("hello 1     wo"), Ok(vec![
+            Token{t: TokenType::Ident("hello".to_string()), source_ref: SourceRef::new(0, 5)},
+            Token{t: TokenType::Int("1".to_string()), source_ref: SourceRef::new(6, 1)},
+            Token{t: TokenType::Ident("wo".to_string()), source_ref: SourceRef::new(12, 2)},
+        ]));
     }
+
 }

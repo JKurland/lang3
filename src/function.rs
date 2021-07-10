@@ -142,7 +142,14 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
     let mut item_start_idx = 0;
     let mut state = State::NewItem;
     let mut items = Vec::new();
-    for (idx, token) in token_stream.iter().chain(std::iter::once(&Token{t: TokenType::EOF})).enumerate() {
+
+    let last_token = token_stream.last();
+    let eof = match last_token {
+        None => return Ok(items),
+        Some(last) => Token{t: TokenType::EOF, source_ref: last.source_ref.empty_after()},
+    };
+
+    for (idx, token) in token_stream.iter().chain(std::iter::once(&eof)).enumerate() {
         let new_state = match state {
             State::NewItem => {
                 item_start_idx = idx;
@@ -188,7 +195,7 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
                     TokenType::OpenBrace => State::InnerScope(1, Box::new(state)),
                     TokenType::CloseBrace => {
                         match token_stream.get(idx + 1) {
-                            Some(Token{t: TokenType::Else}) => State::Skip(1, Box::new(State::Else)),
+                            Some(Token{t: TokenType::Else, ..}) => State::Skip(1, Box::new(State::Else)),
                             _ => State::FinishedItem(FunctionItemType::If),
                         }
                     },
@@ -304,8 +311,8 @@ pub(crate) fn parse_body(token_stream: &[Token]) -> Result<FunctionAst> {
 }
 
 fn parse_scope(token_stream: &[Token]) -> Result<FunctionAst> {
-    assert_eq!(token_stream.get(0), Some(&Token{t: TokenType::OpenBrace}));
-    assert_eq!(token_stream.last(), Some(&Token{t: TokenType::CloseBrace}));
+    assert_eq!(token_stream.get(0).unwrap().t, TokenType::OpenBrace);
+    assert_eq!(token_stream.last().unwrap().t, TokenType::CloseBrace);
 
     parse_body(&token_stream[1..token_stream.len()-1])
 }
@@ -324,11 +331,12 @@ fn parse_item(item: &FunctionItem) -> Result<FunctionAst> {
 }
 
 fn parse_loop(token_stream: &[Token]) -> Result<FunctionAst> {
-    assert_eq!(token_stream.get(0), Some(&Token{t: TokenType::Loop}));
-    assert_eq!(token_stream.last(), Some(&Token{t: TokenType::CloseBrace}));
+    assert_eq!(token_stream.get(0).unwrap().t, TokenType::Loop);
+    assert_eq!(token_stream.last().unwrap().t, TokenType::CloseBrace);
     
-    if token_stream.get(1) != Some(&Token{t: TokenType::OpenBrace}) {
-        return Err(Error::SyntaxErrorExpected(vec!["{"]));
+    match token_stream.get(1) {
+        Some(&Token{t: TokenType::OpenBrace, ..}) => {},
+        _ => return Err(Error::SyntaxErrorExpected(vec!["{"])),
     }
 
     let loop_body_tokens = &token_stream[2..token_stream.len()-1];
@@ -341,12 +349,12 @@ fn parse_loop(token_stream: &[Token]) -> Result<FunctionAst> {
 }
 
 fn parse_return(token_stream: &[Token]) -> Result<FunctionAst> {
-    assert_eq!(token_stream.get(0), Some(&Token{t: TokenType::Return}));
+    assert_eq!(token_stream.get(0).unwrap().t, TokenType::Return);
     Ok(FunctionAst{t: FunctionAstType::Return(Box::new(parse_expr(&token_stream[1..])?))})
 }
 
 fn parse_let(token_stream: &[Token]) -> Result<FunctionAst> {
-    assert_eq!(token_stream.get(0), Some(&Token{t: TokenType::Let}));
+    assert_eq!(token_stream.get(0).unwrap().t, TokenType::Let);
 
     let ident = match token_stream.get(1).unwrap().t {
         TokenType::Ident(ref s) => s.clone(),
@@ -446,8 +454,8 @@ fn parse_assign(token_stream: &[Token]) -> Result<FunctionAst> {
 }
 
 fn parse_if(token_stream: &[Token]) -> Result<FunctionAst> {
-    assert_eq!(token_stream.get(0), Some(&Token{t: TokenType::If}));
-    assert_eq!(token_stream.last(), Some(&Token{t: TokenType::CloseBrace}));
+    assert_eq!(token_stream.get(0).unwrap().t, TokenType::If);
+    assert_eq!(token_stream.last().unwrap().t, TokenType::CloseBrace);
 
     let open_brace_pos = 
         token_stream
@@ -723,7 +731,7 @@ fn parse_struct_init(token_stream: &[Token]) -> Result<FunctionAst> {
 
 
 fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
-    let expr_body = if token_stream.last() == Some(&Token{t: TokenType::SemiColon}) {
+    let expr_body = if let Some(&Token{t: TokenType::SemiColon, ..}) = token_stream.last() {
         &token_stream[0..token_stream.len()-1]
     } else {
         token_stream

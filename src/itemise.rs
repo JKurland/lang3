@@ -241,6 +241,8 @@ mod test {
     #[cfg(test)]
     use super::*;
     #[cfg(test)]
+    use crate::SourceRef;
+    #[cfg(test)]
     use crate::lex::lex;
     #[cfg(test)]
     use maplit::hashmap;
@@ -253,7 +255,15 @@ mod test {
             items.unwrap(),
             hashmap!{
                 ItemPath::new("a") => Item{t: ItemType::Fn(FunctionSignature{args: Vec::new(), return_type: Type::Null}), tokens: vec![]},
-                ItemPath::new("s") => Item{t: ItemType::Struct, tokens: vec![Token{t: TokenType::Int("1".to_string())}]}
+                ItemPath::new("s") => Item{
+                    t: ItemType::Struct, 
+                    tokens: vec![
+                        Token{
+                            t: TokenType::Int("1".to_string()),
+                            source_ref: SourceRef::new(20, 1)
+                        }
+                    ]
+                }
             }
         );
     }

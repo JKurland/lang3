@@ -5,6 +5,7 @@ use futures::channel::oneshot::{channel, Sender, Receiver};
 use futures::executor::ThreadPool;
 use inference::Type;
 use itemise::{ItemPath, ItemType};
+use std::cmp::{max, min};
 use std::future::Future;
 use std::collections::hash_map;
 use futures::future::{FutureExt, Shared};
@@ -22,6 +23,59 @@ pub(crate) mod vm;
 pub(crate) mod storage;
 pub(crate) mod structs;
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub(crate) struct SourceRef {
+    start: usize,
+    end: usize,
+}
+
+impl SourceRef {
+    fn new(start: usize, len: usize) -> Self {
+        Self {
+            start,
+            end: start + len,
+        }
+    }
+
+    // includes self, o and everything in between
+    pub(crate) fn to(&self, o: &SourceRef) -> SourceRef {
+        SourceRef {
+            start: min(self.start, o.start),
+            end: max(self.end, o.end),
+        }
+    }
+
+    pub(crate) fn lines<'a>(&self, source: &'a str) -> &'a str {
+        let maybe_first_newline;
+        if self.start < source.len() {
+            maybe_first_newline = source[..self.start+1].rfind('\n');
+        } else {
+            maybe_first_newline = source.rfind('\n');
+        }
+
+        let after_first_newline = match maybe_first_newline {
+            Some(i) => i + 1,
+            None => 0,
+        };
+
+        let last_newline;
+        if self.end - 1 < source.len() {
+            last_newline = source[self.end-1..].find('\n').unwrap_or(source.len());
+        } else {
+            last_newline = source.len();
+        }
+
+        if after_first_newline == last_newline {
+            ""
+        } else {
+            &source[after_first_newline..last_newline]
+        }
+    }
+
+    pub(crate) fn empty_after(&self) -> Self {
+        Self::new(self.end, 0)
+    }
+}
 
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum Error {
@@ -92,7 +146,6 @@ impl fmt::Display for Error {
             Error::SelfReferentialType => write!(f, "Could not infer types, self referential type"),
             Error::StructMemberNameConflict(name) => write!(f, "Two struct members have the same name {}", name),
             Error::UnexpectedEndOfStruct => write!(f, "Unexpected end of struct"),
-            
         }
     }
 }
