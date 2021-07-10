@@ -64,11 +64,11 @@ impl TypeExpression {
 
                             parent_type = match s.get_member(field) {
                                 Some(t) => t.clone(),
-                                None => return Err(Error::new("Struct has no such field"))
+                                None => return Err(Error::StructHasNoField(item_path.clone(), field.clone()))
                             };
 
                         } else {
-                            return Err(Error::new("Field access on non struct type"));
+                            return Err(Error::FieldAccessOnInvalidType(parent_type));
                         }
                     }
                     *self = TypeExpression::Type(parent_type);
@@ -143,7 +143,7 @@ impl InferenceSystem {
             match (&eqn.lhs, &eqn.rhs) {
                 (TypeExpression::Type(a), TypeExpression::Type(b)) => {
                     if a != b {
-                        return Err(Error::new("Type error2"));
+                        return Err(Error::TypeMismatch(a.clone(), b.clone()));
                     }
                 }
                 _ => {}
@@ -199,7 +199,7 @@ impl InferenceSystem {
             match (&eqn.lhs, &eqn.rhs) {
                 (TypeExpression::Placeholder(obj), rhs) => {
                     if rhs.depends_on(*obj) {
-                        return Err(Error::new("Self referential type"));
+                        return Err(Error::SelfReferentialType);
                     }
                 },
                 _ => {}

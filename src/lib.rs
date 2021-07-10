@@ -3,6 +3,8 @@
 use chashmap::CHashMap;
 use futures::channel::oneshot::{channel, Sender, Receiver};
 use futures::executor::ThreadPool;
+use inference::Type;
+use itemise::{ItemPath, ItemType};
 use std::future::Future;
 use std::collections::hash_map;
 use futures::future::{FutureExt, Shared};
@@ -22,22 +24,75 @@ pub(crate) mod structs;
 
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Error {
-    msg: String
+pub(crate) enum Error {
+    TypeNotInferred,
+    NoSuchItem(ItemPath),
+    WrongItemType{path: ItemPath, expected: ItemType, got: ItemType},
+    StructHasNoField(ItemPath, String),
+    FieldAccessOnInvalidType(Type),
+    ExpectedFn{path: ItemPath, got: ItemType},
+    UnreachableStatement,
+    BreakOutsideOfLoop,
+    ParenGroupAsPrefix,
+    BraceGroupAsPrefix,
+    InvalidEmptyParens,
+    FunctionCallRequiresIdent,
+    WrongNumberOfFunctionArgs{expected: usize, got: usize},
+    NoStructNameBeforeBrace,
+    StructInitRequiresIdent,
+    ExpectedStructFieldName,
+    InvalidComma,
+    FunctionArgMustEvaluate,
+    SyntaxErrorExpected(Vec<&'static str>),
+    SyntaxErrorUnexpected(Vec<&'static str>),
+    UnexpectedEndOfFunction,
+    NameRedefined(String),
+    UnknownName(String),
+    StringNotClosed,
+    UnknownToken,
+    UnexpectedEof,
+    TypeMismatch(Type, Type),
+    SelfReferentialType,
+    StructMemberNameConflict(String),
+    UnexpectedEndOfStruct,
 }
 
 impl std::error::Error for Error {}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Error: {}", self.msg)
-    }
-}
-
-impl Error {
-    pub(crate) fn new(msg: &str) -> Self {
-        Self {
-            msg: msg.to_string()
+        match self {
+            Error::TypeNotInferred => write!(f, "Type not inferred"),
+            Error::NoSuchItem(path) => write!(f, "No such item: {:?}", path),
+            Error::WrongItemType{path, expected, got} => write!(f, "Item {:?} was expected to be {:?}, was {:?}", path, expected, got),
+            Error::StructHasNoField(path, field_name) => write!(f, "Struct {:?} has no field {}", path, field_name),
+            Error::FieldAccessOnInvalidType(t) => write!(f, "Cannot do field access on object of type: {:?}", t),
+            Error::ExpectedFn{path, got} => write!(f, "Expected fn on path {:?}, got {:?}", path, got),
+            Error::UnreachableStatement => write!(f, "A statement in the code is unreachable"),
+            Error::BreakOutsideOfLoop => write!(f, "Break statements are only allowed in loops"),
+            Error::ParenGroupAsPrefix => write!(f, "Paren group not supported as prefix operator"),
+            Error::BraceGroupAsPrefix => write!(f, "Brace group not supported as prefix operator"),
+            Error::InvalidEmptyParens => write!(f, "Parens should not be empty"),
+            Error::FunctionCallRequiresIdent => write!(f, "Function calls currently only support function by name"),
+            Error::WrongNumberOfFunctionArgs{expected, got} => write!(f, "Wrong number of function args, expected: {}, got: {}", expected, got),
+            Error::NoStructNameBeforeBrace => write!(f, "Expected struct name before brace group"),
+            Error::StructInitRequiresIdent => write!(f, "Struct inits currently only support struct by name"),
+            Error::ExpectedStructFieldName => write!(f, "Expected struct field name"),
+            Error::InvalidComma => write!(f, "comma must be inside function arguments"),
+            Error::FunctionArgMustEvaluate => write!(f, "Function arg must evaluate"),
+            Error::SyntaxErrorExpected(tokens) => write!(f, "Syntax error, expected {:?}", tokens),
+            Error::SyntaxErrorUnexpected(tokens) => write!(f, "Syntax error, unexpected {:?}", tokens),
+            Error::UnexpectedEndOfFunction => write!(f, "Unexpected end of function"),
+            Error::NameRedefined(name) => write!(f, "Name {} redefined", name),
+            Error::UnknownName(name) => write!(f, "Unkown name {}", name),
+            Error::StringNotClosed => write!(f, "String literal not closed"),
+            Error::UnknownToken => write!(f, "Unkown token"),
+            Error::UnexpectedEof => write!(f, "Unexpected end of file"),
+            Error::TypeMismatch(a, b) => write!(f, "Type mismatch, {:?} and {:?}", a, b),
+            Error::SelfReferentialType => write!(f, "Could not infer types, self referential type"),
+            Error::StructMemberNameConflict(name) => write!(f, "Two struct members have the same name {}", name),
+            Error::UnexpectedEndOfStruct => write!(f, "Unexpected end of struct"),
+            
         }
     }
 }
@@ -45,7 +100,7 @@ impl Error {
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone)]
-pub struct CacheKey {
+pub(crate) struct CacheKey {
     hash: u64,
     partial_eq: fn(&dyn Any, &dyn Any) -> bool,
     query: Arc<dyn Any + Send + Sync>,
@@ -79,15 +134,15 @@ impl CacheKey {
     }
 }
 
-pub enum CacheEntry {
+pub(crate) enum CacheEntry {
     Running(Shared<Receiver<()>>),
     Failed(Box<dyn Any + Send + Sync>),
     Complete(Arc<dyn Any + Send + Sync>),
 }
 
-pub type ResultCache = CHashMap<CacheKey, CacheEntry>;
+pub(crate) type ResultCache = CHashMap<CacheKey, CacheEntry>;
 
-pub struct Program {
+pub(crate) struct Program {
     pool: ThreadPool,
     result_cache: ResultCache,
     src: String,
@@ -108,7 +163,7 @@ async fn wrap_fut<T: Send + Sync + 'static, Fut: Future<Output = Result<T>>>(fut
 }
 
 impl Program {
-    pub fn new(src: String) -> Self {
+    pub(crate) fn new(src: String) -> Self {
         Self {
             pool: ThreadPool::new().unwrap(),
             result_cache: CHashMap::new(),
@@ -116,7 +171,7 @@ impl Program {
         }
     }
 
-    pub async fn run_query<Q: Query, T: Sync + Send + 'static, Fut>(self: &Arc<Self>, query: Q, future: Fut) -> Result<Arc<T>>
+    pub(crate) async fn run_query<Q: Query, T: Sync + Send + 'static, Fut>(self: &Arc<Self>, query: Q, future: Fut) -> Result<Arc<T>>
     where
     Fut: Future<Output = Result<T>> + Send + 'static {
         let cache_key = CacheKey::new(query);
@@ -152,12 +207,12 @@ impl Program {
         }
     }
 
-    pub fn get_src(&self) -> &str {
+    pub(crate) fn get_src(&self) -> &str {
         &self.src
     }
 }
 
-pub trait Query: Send + Sync + Clone + Hash + PartialEq + 'static {
+pub(crate) trait Query: Send + Sync + Clone + Hash + PartialEq + 'static {
     // Queries need to be Send, Sync, and cheap to Clone
     type Output;
 }

@@ -114,7 +114,7 @@ impl Lexer for StringLiteral {
             if let Some(close_idx) = content.find('"') {
                 return Ok(close_idx + 2)
             } else {
-                return Err(Error::new("String isn't closed"));
+                return Err(Error::StringNotClosed);
             }
         } else {
             return Ok(0);
@@ -202,7 +202,7 @@ pub(crate) fn lex(mut s: &str) -> Result<Vec<Token>> {
         let (token, remaining) = s.split_at(max_token_length);
         s = remaining;
         match matched_lexer {
-            None => return Err(Error::new("no matching lexer")),
+            None => return Err(Error::UnknownToken),
             Some(lexer) => tokens.push(Token{t: lexer.make_token(token)})
         }
     }

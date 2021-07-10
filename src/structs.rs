@@ -21,7 +21,7 @@ impl Struct {
     fn add_member(&mut self, name: String, t: Type) -> Result<()> {
         for (field_name, _) in self.members.iter() {
             if &name == field_name {
-                return Err(Error::new("struct member name conflict"));
+                return Err(Error::StructMemberNameConflict(field_name.clone()));
             }
         }
         self.members.push((name, t));
@@ -71,7 +71,7 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
                         State::AfterName(name.clone())
                     },
                     _ => {
-                        return Err(Error::new("Expected member name"));
+                        return Err(Error::SyntaxErrorExpected(vec!["member name identifier"]));
                     }
                 }
             },
@@ -81,7 +81,7 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
                         State::AfterColon(name)
                     },
                     _ => {
-                        return Err(Error::new("Expected :"));
+                        return Err(Error::SyntaxErrorExpected(vec![":"]));
                     }
                 }
             },
@@ -96,7 +96,7 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
                         State::MemberEnd
                     },
                     _ => {
-                        return Err(Error::new("Expected type name"));
+                        return Err(Error::SyntaxErrorExpected(vec!["type name"]));
                     }
                 }
             },
@@ -106,7 +106,7 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
                         State::MemberStart
                     },
                     _ => {
-                        return Err(Error::new("Expected ,"));
+                        return Err(Error::SyntaxErrorExpected(vec![","]));
                     }
                 }
             },
@@ -119,7 +119,7 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
             Ok(struct_)
         },
         _ => {
-            Err(Error::new("Unexpected end of struct"))
+            Err(Error::UnexpectedEndOfStruct)
         }
     }
 }
@@ -145,14 +145,14 @@ impl GetStruct {
         let global_items = make_query!(&prog, GetGlobalItems).await?;
 
         let item = global_items.get(&self.path).ok_or(
-            Error::new("Could not find struct")
+            Error::NoSuchItem(self.path.clone())
         )?;
 
         match item.t {
             ItemType::Struct => {
                 return parse_struct_item(&item.tokens)
             },
-            _ => return Err(Error::new("Not a struct")),
+            _ => return Err(Error::WrongItemType{path: self.path, expected: ItemType::Struct, got: item.t.clone()}),
         }
     }
 }

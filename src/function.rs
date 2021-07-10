@@ -166,14 +166,14 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
             State::IfSignature => {
                 match token.t {
                     TokenType::OpenBrace => State::IfBody,
-                    TokenType::CloseBrace => return Err(Error::new("Unexpected }")),
+                    TokenType::CloseBrace => return Err(Error::SyntaxErrorUnexpected(vec!["}"])),
                     _ => State::IfSignature,
                 }
             },
             State::LoopSignature => {
                 match token.t {
                     TokenType::OpenBrace => State::Body(FunctionItemType::Loop),
-                    _ => return Err(Error::new("Expected {")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["{"])),
                 }
             },
             State::Expr => {
@@ -198,7 +198,7 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
             State::Break => {
                 match token.t {
                     TokenType::SemiColon | TokenType::EOF => State::FinishedItem(FunctionItemType::Break),
-                    _ => return Err(Error::new("Expected ;")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec![";"])),
                 }
             },
             State::Skip(left_to_skip, outer_state) => {
@@ -212,7 +212,7 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
                 match token.t {
                     TokenType::If => State::IfSignature,
                     TokenType::OpenBrace => State::Body(FunctionItemType::If),
-                    _ => return Err(Error::new("Exected if or {")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["if", "{"])),
                 }
             },
             State::Body(item_type) => {
@@ -284,7 +284,7 @@ fn itemise_function(token_stream: &[Token]) -> Result<Vec<FunctionItem>> {
 
     match state {
         State::NewItem => Ok(items),
-        _ => Err(Error::new("Unexpected end of item")),
+        _ => Err(Error::UnexpectedEndOfFunction),
     }
 }
 
@@ -328,7 +328,7 @@ fn parse_loop(token_stream: &[Token]) -> Result<FunctionAst> {
     assert_eq!(token_stream.last(), Some(&Token{t: TokenType::CloseBrace}));
     
     if token_stream.get(1) != Some(&Token{t: TokenType::OpenBrace}) {
-        return Err(Error::new("Expected {"));
+        return Err(Error::SyntaxErrorExpected(vec!["{"]));
     }
 
     let loop_body_tokens = &token_stream[2..token_stream.len()-1];
@@ -350,7 +350,7 @@ fn parse_let(token_stream: &[Token]) -> Result<FunctionAst> {
 
     let ident = match token_stream.get(1).unwrap().t {
         TokenType::Ident(ref s) => s.clone(),
-        _ => return Err(Error::new("Expected ident after let")),
+        _ => return Err(Error::SyntaxErrorExpected(vec!["identifier"])),
     };
 
     let eq_idx = token_stream.iter()
@@ -371,7 +371,7 @@ fn parse_let(token_stream: &[Token]) -> Result<FunctionAst> {
                 value: Box::new(parse_expr(&token_stream[i + 1..])?),
             }})
         },
-        None => Err(Error::new("Expected = after let")),
+        None => Err(Error::SyntaxErrorExpected(vec!["="])),
     }
 }
 
@@ -397,7 +397,7 @@ fn parse_assign(token_stream: &[Token]) -> Result<FunctionAst> {
                         ident = Some(s.clone());
                         State::AfterIdent
                     },
-                    _ => return Err(Error::new("Expecting ident"))
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["identifier"]))
                 }
             },
             State::ExpectingIdent => {
@@ -406,13 +406,13 @@ fn parse_assign(token_stream: &[Token]) -> Result<FunctionAst> {
                         field_spec.push(s.clone());
                         State::AfterIdent
                     },
-                    _ => return Err(Error::new("Expecting ident"))
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["identifier"]))
                 }
             },
             State::AfterIdent => {
                 match token.t {
                     TokenType::Dot => State::ExpectingIdent,
-                    _ => return Err(Error::new("Expecting . or ="))
+                    _ => return Err(Error::SyntaxErrorExpected(vec![".", "="]))
                 }
             }
         };
@@ -420,7 +420,7 @@ fn parse_assign(token_stream: &[Token]) -> Result<FunctionAst> {
     }
 
     if state != State::AfterIdent {
-        return Err(Error::new("Expecting ident"));
+        return Err(Error::SyntaxErrorExpected(vec!["identifier"]));
     }
 
     if let None = ident {
@@ -455,7 +455,7 @@ fn parse_if(token_stream: &[Token]) -> Result<FunctionAst> {
             .position(|t| t.t == TokenType::OpenBrace).unwrap();
 
     if open_brace_pos == 1 {
-        return Err(Error::new("Expected condition"));
+        return Err(Error::SyntaxErrorExpected(vec!["condition"]));
     }
 
     let condition_tokens = &token_stream[1..open_brace_pos];
@@ -485,7 +485,7 @@ fn parse_if(token_stream: &[Token]) -> Result<FunctionAst> {
                 // in the case of "else if {"
                 &token_stream[else_pos+1..token_stream.len()-1]
             } else {
-                return Err(Error::new("Expected if or {"));
+                return Err(Error::SyntaxErrorExpected(vec!["if", "{"]));
             }
         }
     };
@@ -614,13 +614,13 @@ fn parse_expr_inner(operators: &[Operator], token_stream: &[Token], left_end: us
         }
     } else {
         if left_end != right_end {
-            Err(Error::new("Invalid expression, expected literal"))
+            Err(Error::SyntaxErrorExpected(vec!["literal"]))
         } else {
             match token_stream[left_end].t {
                 TokenType::Int(ref s) => Ok(FunctionAst{t: FunctionAstType::U32(parse_u32(&s))}),
                 TokenType::String(ref s) => Ok(FunctionAst{t: FunctionAstType::StringLiteral(s.clone())}),
                 TokenType::Ident(ref s) => Ok(FunctionAst{t: FunctionAstType::VarName(s.clone())}),
-                _ => Err(Error::new("Unexpected token in expr")),
+                _ => Err(Error::SyntaxErrorExpected(vec!["literal"])),
             }
         }
     }
@@ -652,7 +652,7 @@ fn parse_struct_init(token_stream: &[Token]) -> Result<FunctionAst> {
                         State::ExpectingColon(field_name.clone())
                     },
                     _ => {
-                        return Err(Error::new("Expecting field name"));
+                        return Err(Error::SyntaxErrorExpected(vec!["field name"]));
                     }
                 }
             },
@@ -662,7 +662,7 @@ fn parse_struct_init(token_stream: &[Token]) -> Result<FunctionAst> {
                         State::ExprTopLevel{expr_start: idx + 1, field_name}
                     },
                     _ => {
-                        return Err(Error::new("Expecting colon"));
+                        return Err(Error::SyntaxErrorExpected(vec![":"]));
                     }
                 }
             },
@@ -739,6 +739,11 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
         Paren,
         Brace,
     }
+
+    let group_close = |g| match g {
+        GroupType::Paren => ")",
+        GroupType::Brace => "}",
+    };
 
     #[derive(Debug)]
     enum State {
@@ -830,8 +835,8 @@ fn parse_expr(token_stream: &[Token]) -> Result<FunctionAst> {
         state = new_state;
     }
 
-    if let State::InGroup{..} = state {
-        return Err(Error::new("Expected close"));
+    if let State::InGroup{group_type, ..} = state {
+        return Err(Error::SyntaxErrorExpected(vec![group_close(group_type)]));
     }
 
     // fill in the lhs and rhs of each operator
@@ -1033,7 +1038,7 @@ impl Graph {
         let new_object = self.new_object(source);
         let old_value = self.names.last_mut().unwrap().insert(name.to_string(), new_object);
         if old_value.is_some() {
-            return Err(Error::new("Name redefined"));
+            return Err(Error::NameRedefined(name.to_string()));
         } else {
             return Ok(new_object);
         }
@@ -1044,7 +1049,7 @@ impl Graph {
                 return Ok(*handle);
             }
         }
-        Err(Error::new("No such name"))
+        Err(Error::UnknownName(name.to_string()))
     }
 
     fn block_mut(&mut self, handle: BlockHandle) -> &mut Block {
@@ -1124,7 +1129,7 @@ impl Graph {
         for handle in graph.objects() {
             let object = graph.object(handle);
             if object.t.is_none() {
-                return Err(Error::new("Couldn't infer all types"));
+                return Err(Error::TypeNotInferred);
             }
         }
 
@@ -1138,7 +1143,7 @@ impl Graph {
         'd: 'a
     {
         async move {
-            let unwrap_block = |b: Option<BlockHandle>| b.ok_or(Error::new("Unreachable Statement"));
+            let unwrap_block = |b: Option<BlockHandle>| b.ok_or(Error::UnreachableStatement);
 
             match ast.t {
                 FunctionAstType::IfStatement{ref condition, ref true_, ref false_ } => {
@@ -1217,7 +1222,7 @@ impl Graph {
                 },
                 FunctionAstType::Break => {
                     self.block_mut(current_block).jump = Some(Jump{
-                        t: JumpType::Uncond(ctx.labels.break_.ok_or(Error::new("Break must be inside loop"))?)
+                        t: JumpType::Uncond(ctx.labels.break_.ok_or(Error::BreakOutsideOfLoop)?)
                     });
                     Ok(None)
                 },
@@ -1249,14 +1254,14 @@ impl Graph {
                 },
                 FunctionAstType::ParenGroup{ref lhs, ref inside, ref rhs} => {
                     if rhs.is_some() {
-                        return Err(Error::new("Paren group not supported as prefix operator"));
+                        return Err(Error::ParenGroupAsPrefix);
                     }
 
                     match lhs {
                         None => {
                             let val = self.new_object(ObjectSource::Local);
                             match inside {
-                                None => Err(Error::new("Expected something inside parens")),
+                                None => Err(Error::InvalidEmptyParens),
                                 Some(inside) => self.evaluate_and_store(&**inside, current_block, Some(val), ctx).await,
                             }
                         },
@@ -1266,9 +1271,9 @@ impl Graph {
                             if let FunctionAstType::VarName(ref callee_name) = lhs.t {
                                 callee_path = ItemPath::new(callee_name);
                             } else {
-                                return Err(Error::new("Expected name before parens"))
+                                return Err(Error::FunctionCallRequiresIdent)
                             }
-                            
+
                             let mut block = current_block;
                             let mut args: Vec<ObjectHandle> = vec![];
                             if let Some(top_ast) = inside {
@@ -1277,7 +1282,7 @@ impl Graph {
                                     match ast.t {
                                         FunctionAstType::Comma{ref lhs, ref rhs} => {
                                             let object_handle = self.new_object(ObjectSource::Local);
-                                            block = self.evaluate_and_store(lhs, block, Some(object_handle), ctx).await?.ok_or(Error::new("Function arg doesn't evaluate"))?;
+                                            block = self.evaluate_and_store(lhs, block, Some(object_handle), ctx).await?.ok_or(Error::FunctionArgMustEvaluate)?;
                                             args.push(object_handle);
 
                                             if let Some(ref rhs_ast) = rhs {
@@ -1288,7 +1293,7 @@ impl Graph {
                                         },
                                         _ => {
                                             let object_handle = self.new_object(ObjectSource::Local);
-                                            block = self.evaluate_and_store(ast, block, Some(object_handle), ctx).await?.ok_or(Error::new("Function arg doesn't evaluate"))?;
+                                            block = self.evaluate_and_store(ast, block, Some(object_handle), ctx).await?.ok_or(Error::FunctionArgMustEvaluate)?;
                                             args.push(object_handle);
                                             break;
                                         }
@@ -1298,8 +1303,12 @@ impl Graph {
 
                             let signature = make_query!(ctx.prog, GetFunctionSignature{path: callee_path.clone()}).await?;
 
-                            if signature.args.len() != args.len() {
-                                return Err(Error::new("Wrong number of args for function"));
+                            {
+                                let expected = signature.args.len();
+                                let got = args.len();
+                                if expected != got {
+                                    return Err(Error::WrongNumberOfFunctionArgs{expected, got});
+                                }
                             }
 
                             let t = InstructionType::Call{
@@ -1317,11 +1326,11 @@ impl Graph {
                 },
                 FunctionAstType::BraceGroup{ref lhs, ref inside, ref rhs} => {
                     if rhs.is_some() {
-                        return Err(Error::new("Brace group not supported as prefix operator"));
+                        return Err(Error::BraceGroupAsPrefix);
                     }
 
                     match lhs {
-                        None => return Err(Error::new("Brace group must be preceded by struct name")),
+                        None => return Err(Error::NoStructNameBeforeBrace),
                         Some(lhs) => {
                             // doing struct init
 
@@ -1329,7 +1338,7 @@ impl Graph {
                             if let FunctionAstType::VarName(ref struct_name) = lhs.t {
                                 struct_path = ItemPath::new(struct_name);
                             } else {
-                                return Err(Error::new("Expected name before parens"))
+                                return Err(Error::StructInitRequiresIdent)
                             }
 
                             let mut cur_block = current_block;
@@ -1380,7 +1389,14 @@ impl Graph {
                 FunctionAstType::Dot{ref lhs, ref rhs} => {
                     if let FunctionAstType::VarName(ref field_name) = rhs.t {
                         let parent_object = self.new_object(ObjectSource::Local);
-                        let cur_block = self.evaluate_and_store(lhs, current_block, Some(parent_object), ctx).await?.ok_or(Error::new("Cannot field access never"))?;
+
+                        let cur_block = self.evaluate_and_store(
+                            lhs,
+                            current_block,
+                            Some(parent_object),
+                            ctx
+                        ).await?.ok_or(Error::FieldAccessOnInvalidType(Type::Never))?;
+
                         if let Some(dest) = object_handle {
                             self.block_mut(cur_block).instructions.push(Instruction{
                                 t: InstructionType::StructFieldAccess {
@@ -1392,11 +1408,11 @@ impl Graph {
                         }
                         return Ok(Some(cur_block));
                     } else {
-                        return Err(Error::new("Expected field name after ."));
+                        return Err(Error::ExpectedStructFieldName);
                     }
                 },
                 FunctionAstType::Comma{..} => {
-                    Err(Error::new("Cannot use comma operator outside of function arguments"))
+                    Err(Error::InvalidComma)
                 },
                 FunctionAstType::U32(i) => {
                     if let Some(obj) = object_handle {
@@ -1601,12 +1617,12 @@ impl GetFunctionAst {
         let global_items = make_query!(&prog, GetGlobalItems).await?;
 
         let item = global_items.get(&self.path).ok_or(
-            Error::new("Could not find function")
+            Error::NoSuchItem(self.path.clone())
         )?;
 
         match item.t {
             ItemType::Fn(_) => parse_body(&item.tokens),
-            _ => return Err(Error::new("Not a function")),
+            _ => return Err(Error::ExpectedFn{path: self.path, got: item.t.clone()}),
         }
     }
 }
@@ -1625,14 +1641,14 @@ impl GetFunctionSignature {
         let global_items = make_query!(&prog, GetGlobalItems).await?;
 
         let item = global_items.get(&self.path).ok_or(
-            Error::new("Could not find function")
+            Error::NoSuchItem(self.path.clone())
         )?;
 
         match item.t {
             ItemType::Fn(ref signature) => {
                 Ok(signature.clone())
             },
-            _ => return Err(Error::new("Not a function")),
+            _ => return Err(Error::ExpectedFn{path: self.path, got: item.t.clone()}),
         }
     }
 }

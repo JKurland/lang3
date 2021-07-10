@@ -56,7 +56,7 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
             State::Initial => {
                 match token.t {
                     TokenType::OpenParen => State::ArgStart,
-                    _ => return Err(Error::new("Expected (")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["("])),
                 }
             },
             State::ArgStart => {
@@ -66,16 +66,16 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
                         if args.len() == 0 {
                             State::ArgsEnd
                         } else {
-                            return Err(Error::new("Expected argument name"));
+                            return Err(Error::SyntaxErrorExpected(vec!["Argument name"]));
                         }
                     }
-                    _ => return Err(Error::new("Expected argument name")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["Argument name"])),
                 }
             },
             State::ArgName(s) => {
                 match token.t {
                     TokenType::Colon => State::ArgNameColon(s),
-                    _ => return Err(Error::new("Expected colon")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec![":s"])),
                 }
             },
             State::ArgNameColon(s) => {
@@ -88,20 +88,20 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
                         args.push((s, Type::U32));
                         State::ArgEnd
                     },
-                    _ => return Err(Error::new("Expected type identifier")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["type identifier"])),
                 }
             },
             State::ArgEnd => {
                 match token.t {
                     TokenType::Comma => State::ArgStart,
                     TokenType::CloseParen => State::ArgsEnd,
-                    _ => return Err(Error::new("Expected , or )")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec![",", ")"])),
                 }
             },
             State::ArgsEnd => {
                 match token.t {
                     TokenType::ThinArrow => State::TypeArrow,
-                    _ => return Err(Error::new("Expected ->")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["->"])),
                 }
             },
             State::TypeArrow => {
@@ -114,11 +114,11 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
                         return_type = Some(Type::U32);
                         State::End
                     },
-                    _ => return Err(Error::new("Expected return type name"))
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["return type name"]))
                 }
             },
             State::End => {
-                return Err(Error::new("Unexpected token"));
+                return Err(Error::SyntaxErrorUnexpected(vec!["token"]));
             }
         };
         state = new_state;
@@ -131,7 +131,7 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
                 return_type: return_type.unwrap_or(Type::Null),
             })
         },
-        _ => Err(Error::new("Unexpected end of function signature"))
+        _ => Err(Error::SyntaxErrorUnexpected(vec!["end of function signature"]))
     }
 
 }
@@ -160,20 +160,20 @@ pub(crate) fn itemise(token_stream: &Vec<Token>) -> Result<HashMap<ItemPath, Ite
                 match token.t {
                     TokenType::Struct => State::StructNoPath,
                     TokenType::Fn => State::FnNoPath,
-                    _ => return Err(Error::new("Expected struct or fn")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["struct", "fn"])),
                 }
             },
 
             State::StructNoPath => {
                 match token.t {
                     TokenType::Ident(ref s) => State::Struct(ItemPath{name: s.clone()}),
-                    _ => return Err(Error::new("Expected struct name")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["struct name"])),
                 }
             },
             State::Struct(path) => {
                 match token.t {
                     TokenType::OpenBrace => State::Body(ItemType::Struct, path, 1),
-                    _ => return Err(Error::new("Expected {")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["{"])),
                 }
             },
 
@@ -183,7 +183,7 @@ pub(crate) fn itemise(token_stream: &Vec<Token>) -> Result<HashMap<ItemPath, Ite
                         path: ItemPath{name: s.clone()},
                         first_token: idx + 1
                     },
-                    _ => return Err(Error::new("Expected fn name")),
+                    _ => return Err(Error::SyntaxErrorExpected(vec!["function name"])),
                 }
             },
             State::FnPartialSignature{path, first_token} => {
@@ -218,7 +218,7 @@ pub(crate) fn itemise(token_stream: &Vec<Token>) -> Result<HashMap<ItemPath, Ite
 
     match state {
         State::NoItem => Ok(rtn),
-        _ => {Err(Error::new("Unexpected end of file"))}
+        _ => {Err(Error::UnexpectedEof)}
     }
 }
 
