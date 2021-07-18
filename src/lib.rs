@@ -50,7 +50,7 @@ impl SourceRef {
         if self.start < source.len() {
             maybe_first_newline = source[..self.start+1].rfind('\n');
         } else {
-            maybe_first_newline = source.rfind('\n');
+            panic!("SourceRef out of range");
         }
 
         let after_first_newline = match maybe_first_newline {
@@ -60,15 +60,23 @@ impl SourceRef {
 
         let last_newline;
         if self.end - 1 < source.len() {
-            last_newline = source[self.end-1..].find('\n').unwrap_or(source.len());
+            last_newline = source[self.end-1..].find('\n').unwrap_or(source.len() - self.end + 1) + self.end - 1;
         } else {
-            last_newline = source.len();
+            panic!("SourceRef out of range");
         }
 
-        if after_first_newline == last_newline {
+        if after_first_newline >= last_newline {
             ""
         } else {
             &source[after_first_newline..last_newline]
+        }
+    }
+
+    pub(crate) fn text<'a>(&self, source: &'a str) -> &'a str {
+        if self.start < source.len() && self.end <= source.len() {
+            &source[self.start..self.end]
+        } else {
+            panic!("SourceRef out of range");
         }
     }
 
@@ -290,6 +298,21 @@ mod tests {
     use vm::GetFunctionVmProgram;
     use itemise::ItemPath;
 
+    #[test]
+    fn test_source_ref() {
+        let s = r#"a b
+c
+
+
+d
+"#;
+
+        assert_eq!(SourceRef::new(1, 1).lines(s), "a b");
+        assert_eq!(SourceRef::new(3, 1).lines(s), "");
+        assert_eq!(SourceRef::new(3, 2).lines(s), "c");
+        assert_eq!(SourceRef::new(3, 4).lines(s), "c\n");
+        assert_eq!(SourceRef::new(7, 2).lines(s), "d");
+    }
 
     fn run_main(src: &str) -> Result<u32> {
         let prog = Arc::new(Program::new(src.to_string()));

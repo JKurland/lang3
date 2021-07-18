@@ -285,11 +285,13 @@ mod test {
 
     #[test]
     fn test_lex_source_ref() {
-        assert_eq!(lex("hello 1     wo"), Ok(vec![
-            Token{t: TokenType::Ident("hello".to_string()), source_ref: SourceRef::new(0, 5)},
-            Token{t: TokenType::Int("1".to_string()), source_ref: SourceRef::new(6, 1)},
-            Token{t: TokenType::Ident("wo".to_string()), source_ref: SourceRef::new(12, 2)},
-        ]));
+        let source = "hello 1     wo";
+        let tokens = lex(source).unwrap();
+        assert_eq!(tokens.len(), 3);
+
+        assert_eq!(tokens[0].source_ref.text(source), "hello");
+        assert_eq!(tokens[1].source_ref.text(source), "1");
+        assert_eq!(tokens[2].source_ref.text(source), "wo");
     }
 
 }
