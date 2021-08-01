@@ -1,4 +1,4 @@
-use crate::{lex::{Token, TokenType, GetTokenStream}, make_query};
+use crate::{SourceRef, lex::{GetTokenStream, Token, TokenType, source_ref_from_tokens}, make_query};
 use std::collections::HashMap;
 use crate::{Result, Error, Query, Program};
 use std::sync::Arc;
@@ -19,8 +19,9 @@ impl ItemPath {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FunctionSignature {
-    pub(crate) args: Vec<(String, Type)>,
+    pub(crate) args: Vec<(String, Type, SourceRef)>,
     pub(crate) return_type: Type,
+    pub(crate) source_ref: SourceRef,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,8 +40,8 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
     enum State {
         Initial,
         ArgStart,
-        ArgName(String),
-        ArgNameColon(String),
+        ArgName(String, usize),
+        ArgNameColon(String, usize),
         ArgEnd,
         ArgsEnd,
         TypeArrow,
@@ -51,57 +52,66 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
     let mut args = Vec::new();
     let mut return_type = None;
 
-    for token in tokens {
+    for (idx, token) in tokens.iter().enumerate() {
         let new_state = match state {
             State::Initial => {
                 match token.t {
                     TokenType::OpenParen => State::ArgStart,
-                    _ => return Err(Error::SyntaxErrorExpected(vec!["("])),
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["("])),
                 }
             },
             State::ArgStart => {
                 match token.t {
-                    TokenType::Ident(ref s) => State::ArgName(s.clone()),
+                    TokenType::Ident(ref s) => State::ArgName(s.clone(), idx),
                     TokenType::CloseParen => {
                         if args.len() == 0 {
                             State::ArgsEnd
                         } else {
-                            return Err(Error::SyntaxErrorExpected(vec!["Argument name"]));
+                            return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["Argument name"]));
                         }
                     }
-                    _ => return Err(Error::SyntaxErrorExpected(vec!["Argument name"])),
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["Argument name"])),
                 }
             },
-            State::ArgName(s) => {
+            State::ArgName(s, start_idx) => {
                 match token.t {
-                    TokenType::Colon => State::ArgNameColon(s),
-                    _ => return Err(Error::SyntaxErrorExpected(vec![":s"])),
+                    TokenType::Colon => State::ArgNameColon(s, start_idx),
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec![":s"])),
                 }
             },
-            State::ArgNameColon(s) => {
+            State::ArgNameColon(s, start_idx) => {
+                let source_ref = tokens[start_idx].source_ref.to(&tokens[idx-1].source_ref);
                 match token.t {
                     TokenType::Ident(ref t) => {
-                        args.push((s, Type::Struct(ItemPath{name: t.clone()})));
+                        args.push((
+                            s, 
+                            Type::Struct(ItemPath{name: t.clone()}),
+                            source_ref,
+                        ));
                         State::ArgEnd
                     },
                     TokenType::U32 => {
-                        args.push((s, Type::U32));
+                        args.push((
+                            s,
+                            Type::U32,
+                            source_ref,
+                        ));
                         State::ArgEnd
                     },
-                    _ => return Err(Error::SyntaxErrorExpected(vec!["type identifier"])),
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["type identifier"])),
                 }
             },
             State::ArgEnd => {
                 match token.t {
                     TokenType::Comma => State::ArgStart,
                     TokenType::CloseParen => State::ArgsEnd,
-                    _ => return Err(Error::SyntaxErrorExpected(vec![",", ")"])),
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec![",", ")"])),
                 }
             },
             State::ArgsEnd => {
                 match token.t {
                     TokenType::ThinArrow => State::TypeArrow,
-                    _ => return Err(Error::SyntaxErrorExpected(vec!["->"])),
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["->"])),
                 }
             },
             State::TypeArrow => {
@@ -114,11 +124,11 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
                         return_type = Some(Type::U32);
                         State::End
                     },
-                    _ => return Err(Error::SyntaxErrorExpected(vec!["return type name"]))
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["return type name"]))
                 }
             },
             State::End => {
-                return Err(Error::SyntaxErrorUnexpected(vec!["token"]));
+                return Err(Error::SyntaxErrorUnexpected(token.source_ref, vec!["token"]));
             }
         };
         state = new_state;
@@ -129,9 +139,10 @@ fn parse_fn_signature(tokens: &[Token]) -> Result<FunctionSignature> {
             Ok(FunctionSignature {
                 args,
                 return_type: return_type.unwrap_or(Type::Null),
+                source_ref: source_ref_from_tokens(tokens),
             })
         },
-        _ => Err(Error::SyntaxErrorUnexpected(vec!["end of function signature"]))
+        _ => Err(Error::SyntaxErrorUnexpected(tokens.last().unwrap().source_ref, vec!["end of function signature"]))
     }
 
 }
@@ -160,20 +171,20 @@ pub(crate) fn itemise(token_stream: &Vec<Token>) -> Result<HashMap<ItemPath, Ite
                 match token.t {
                     TokenType::Struct => State::StructNoPath,
                     TokenType::Fn => State::FnNoPath,
-                    _ => return Err(Error::SyntaxErrorExpected(vec!["struct", "fn"])),
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["struct", "fn"])),
                 }
             },
 
             State::StructNoPath => {
                 match token.t {
                     TokenType::Ident(ref s) => State::Struct(ItemPath{name: s.clone()}),
-                    _ => return Err(Error::SyntaxErrorExpected(vec!["struct name"])),
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["struct name"])),
                 }
             },
             State::Struct(path) => {
                 match token.t {
                     TokenType::OpenBrace => State::Body(ItemType::Struct, path, 1),
-                    _ => return Err(Error::SyntaxErrorExpected(vec!["{"])),
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["{"])),
                 }
             },
 
@@ -183,16 +194,22 @@ pub(crate) fn itemise(token_stream: &Vec<Token>) -> Result<HashMap<ItemPath, Ite
                         path: ItemPath{name: s.clone()},
                         first_token: idx + 1
                     },
-                    _ => return Err(Error::SyntaxErrorExpected(vec!["function name"])),
+                    _ => return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["function name"])),
                 }
             },
             State::FnPartialSignature{path, first_token} => {
                 match token.t {
-                    TokenType::OpenBrace => State::Body(
-                        ItemType::Fn(parse_fn_signature(&token_stream[first_token..idx])?),
-                        path,
-                        1
-                    ),
+                    TokenType::OpenBrace => {
+                        if idx - first_token <= 1 {
+                            return Err(Error::ExpectedFunctionSignature(token.source_ref))
+                        }
+
+                        State::Body(
+                            ItemType::Fn(parse_fn_signature(&token_stream[first_token..idx])?),
+                            path,
+                            1
+                        )
+                    },
                     _ => State::FnPartialSignature{path, first_token},
                 }
             },
@@ -218,7 +235,8 @@ pub(crate) fn itemise(token_stream: &Vec<Token>) -> Result<HashMap<ItemPath, Ite
 
     match state {
         State::NoItem => Ok(rtn),
-        _ => {Err(Error::UnexpectedEof)}
+        // if token_stream is empty, state will be NoItem
+        _ => {Err(Error::UnexpectedEof(token_stream.last().unwrap().source_ref))}
     }
 }
 
@@ -230,8 +248,8 @@ impl Query for GetGlobalItems {
 }
 
 impl GetGlobalItems {
-    pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
-        let tokens = make_query!(&prog, GetTokenStream).await?;
+    pub(crate) async fn make(self, prog: Arc<Program>, query_source: SourceRef) -> <Self as Query>::Output {
+        let tokens = make_query!(&prog, GetTokenStream, query_source).await?;
         itemise(&tokens)
     }
 }
@@ -254,7 +272,7 @@ mod test {
         assert_eq!(
             items.unwrap(),
             hashmap!{
-                ItemPath::new("a") => Item{t: ItemType::Fn(FunctionSignature{args: Vec::new(), return_type: Type::Null}), tokens: vec![]},
+                ItemPath::new("a") => Item{t: ItemType::Fn(FunctionSignature{args: Vec::new(), return_type: Type::Null, source_ref: SourceRef::new(4, 2)}), tokens: vec![]},
                 ItemPath::new("s") => Item{
                     t: ItemType::Struct, 
                     tokens: vec![

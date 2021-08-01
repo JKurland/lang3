@@ -6,7 +6,7 @@ use crate::itemise::ItemPath;
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::function::{GetFunctionGraph, InstructionType, JumpType};
-use crate::{Result, make_query};
+use crate::{Result, SourceRef, make_query};
 use crate::function;
 use crate::storage::Storage;
 use crate::Program;
@@ -89,7 +89,7 @@ fn size<'a, 'b: 'a, 'c: 'a>(t: &'b Type, prog: &'c Arc<Program>) -> BoxFuture<'a
             Type::Never => Ok(0),
             Type::Null => Ok(0),
             Type::Struct(path) => {
-                let struct_ = make_query!(prog, GetStruct{path: path.clone()}).await?;
+                let struct_ = make_query!(prog, GetStruct{path: path.clone()}, SourceRef::new(0,0)).await?;
                 let mut s = 0;
                 for t in struct_.member_types() {
                     s = align_up_to(s, align(t, prog).await?);
@@ -110,7 +110,7 @@ fn align<'a, 'b: 'a, 'c: 'a>(t: &'b Type, prog: &'c Arc<Program>) -> BoxFuture<'
             Type::Never => Ok(1),
             Type::Null => Ok(1),
             Type::Struct(path) => {
-                let struct_ = make_query!(prog, GetStruct{path: path.clone()}).await?;
+                let struct_ = make_query!(prog, GetStruct{path: path.clone()}, SourceRef::new(0,0)).await?;
                 let first_type = struct_.member_types().next();
                 match first_type {
                     Some(t) => {
@@ -135,21 +135,21 @@ async fn struct_field_offset(struct_: &Arc<Struct>, prog: &Arc<Program>, field_n
 }
 
 async fn field_offset(struct_path: &ItemPath, prog: Arc<Program>, field_name: &str) -> Result<usize> {
-    let struct_ = make_query!(prog, GetStruct{path: struct_path.clone()}).await?;
+    let struct_ = make_query!(prog, GetStruct{path: struct_path.clone()}, SourceRef::new(0,0)).await?;
     struct_field_offset(&struct_, &prog, field_name).await
 }
 
 async fn field_spec_offset(struct_path: &ItemPath, prog: Arc<Program>, field_spec: &[String]) -> Result<usize> {
     let mut offset = 0;
 
-    let mut struct_ = make_query!(prog, GetStruct{path: struct_path.clone()}).await?;
+    let mut struct_ = make_query!(prog, GetStruct{path: struct_path.clone()}, SourceRef::new(0,0)).await?;
     for field_name in field_spec.iter().take(field_spec.len() - 1) {
 
         offset += struct_field_offset(&struct_, &prog, field_name).await?;
 
         let next_struct_type = struct_.get_member(field_name).unwrap();
         if let Type::Struct(next_item_path) = next_struct_type {
-            struct_ = make_query!(prog, GetStruct{path: next_item_path.clone()}).await?;
+            struct_ = make_query!(prog, GetStruct{path: next_item_path.clone()}, SourceRef::new(0,0)).await?;
         } else {
             panic!("Field access on non struct in vm");
         }
@@ -779,7 +779,7 @@ impl crate::Query for GetFunctionVmProgram {
 }
 
 impl GetFunctionVmProgram {
-    pub(crate) async fn make(self, prog: Arc<crate::Program>) -> <Self as crate::Query>::Output {
+    pub(crate) async fn make(self, prog: Arc<crate::Program>, query_source: SourceRef) -> <Self as crate::Query>::Output {
         let mut vm_prog = VmProgram::new();    
         let mut deps = vec![self.path];
         let mut halt_on_return = true;
@@ -789,7 +789,7 @@ impl GetFunctionVmProgram {
 
             let graph_futures = 
                 deps.iter()
-                .map(|path| crate::make_query!(&prog, GetFunctionGraph{path: path.clone()}));
+                .map(|path| crate::make_query!(&prog, GetFunctionGraph{path: path.clone()}, query_source));
 
             let graphs = futures::future::try_join_all(graph_futures).await?;
 

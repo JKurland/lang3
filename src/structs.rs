@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use crate::inference::Type;
 use crate::lex::{Token, TokenType};
-use crate::{Error, Program, Query, Result, make_query};
+use crate::{Error, Program, Query, Result, SourceRef, make_query};
 use crate::itemise::{GetGlobalItems, ItemPath, ItemType};
 
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Struct {
-    members: Vec<(String, Type)>,
+    members: Vec<(String, Type, SourceRef)>,
 }
 
 impl Struct {
@@ -18,18 +18,18 @@ impl Struct {
         }
     }
 
-    fn add_member(&mut self, name: String, t: Type) -> Result<()> {
-        for (field_name, _) in self.members.iter() {
+    fn add_member(&mut self, name: String, t: Type, source_ref: SourceRef) -> Result<()> {
+        for (field_name, _, o_source_ref) in self.members.iter() {
             if &name == field_name {
-                return Err(Error::StructMemberNameConflict(field_name.clone()));
+                return Err(Error::StructMemberNameConflict(source_ref, field_name.clone(), *o_source_ref));
             }
         }
-        self.members.push((name, t));
+        self.members.push((name, t, source_ref));
         Ok(())
     }
 
     pub(crate) fn get_member(&self, name: &str) -> Option<&Type> {
-        for (field_name, t) in self.members.iter() {
+        for (field_name, t, _) in self.members.iter() {
             if name == field_name {
                 return Some(t);
             }
@@ -42,7 +42,7 @@ impl Struct {
     }
 
     pub(crate) fn member_idx(&self, name: &str) -> Option<usize> {
-        for (idx, (field_name, _)) in self.members.iter().enumerate() {
+        for (idx, (field_name, _, _)) in self.members.iter().enumerate() {
             if name == field_name {
                 return Some(idx);
             }
@@ -55,48 +55,49 @@ impl Struct {
 fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
     enum State {
         MemberStart,
-        AfterName(String),
-        AfterColon(String),
+        AfterName(String, usize /*field state*/),
+        AfterColon(String, usize /*field state*/),
         MemberEnd,
     }
 
     let mut state = State::MemberStart;
     let mut struct_ = Struct::new();
 
-    for token in tokens {
+    for (idx, token) in tokens.iter().enumerate() {
         let new_state = match state {
             State::MemberStart => {
                 match &token.t {
                     TokenType::Ident(name) => {
-                        State::AfterName(name.clone())
+                        State::AfterName(name.clone(), idx)
                     },
                     _ => {
-                        return Err(Error::SyntaxErrorExpected(vec!["member name identifier"]));
+                        return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["member name identifier"]));
                     }
                 }
             },
-            State::AfterName(name) => {
+            State::AfterName(name, start_idx) => {
                 match token.t {
                     TokenType::Colon => {
-                        State::AfterColon(name)
+                        State::AfterColon(name, start_idx)
                     },
                     _ => {
-                        return Err(Error::SyntaxErrorExpected(vec![":"]));
+                        return Err(Error::SyntaxErrorExpected(token.source_ref, vec![":"]));
                     }
                 }
             },
-            State::AfterColon(name) => {
+            State::AfterColon(name, start_idx) => {
+                let source_ref = tokens[start_idx].source_ref.to(&tokens[idx].source_ref);
                 match &token.t {
                     TokenType::Ident(type_name) => {
-                        struct_.add_member(name, Type::Struct(ItemPath::new(&type_name)))?;
+                        struct_.add_member(name, Type::Struct(ItemPath::new(&type_name)), source_ref)?;
                         State::MemberEnd
                     },
                     TokenType::U32 => {
-                        struct_.add_member(name, Type::U32)?;
+                        struct_.add_member(name, Type::U32, source_ref)?;
                         State::MemberEnd
                     },
                     _ => {
-                        return Err(Error::SyntaxErrorExpected(vec!["type name"]));
+                        return Err(Error::SyntaxErrorExpected(token.source_ref, vec!["type name"]));
                     }
                 }
             },
@@ -106,7 +107,7 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
                         State::MemberStart
                     },
                     _ => {
-                        return Err(Error::SyntaxErrorExpected(vec![","]));
+                        return Err(Error::SyntaxErrorExpected(token.source_ref, vec![","]));
                     }
                 }
             },
@@ -119,7 +120,8 @@ fn parse_struct_item(tokens: &[Token]) -> Result<Struct> {
             Ok(struct_)
         },
         _ => {
-            Err(Error::UnexpectedEndOfStruct)
+            // if tokens was empty state would be State::MemberStart
+            Err(Error::UnexpectedEndOfStruct(tokens[0].source_ref))
         }
     }
 }
@@ -141,18 +143,18 @@ impl Query for GetStruct {
 }
 
 impl GetStruct {
-    pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
-        let global_items = make_query!(&prog, GetGlobalItems).await?;
+    pub(crate) async fn make(self, prog: Arc<Program>, query_source: SourceRef) -> <Self as Query>::Output {
+        let global_items = make_query!(&prog, GetGlobalItems, query_source).await?;
 
         let item = global_items.get(&self.path).ok_or(
-            Error::NoSuchItem(self.path.clone())
+            Error::NoSuchItem(query_source, self.path.clone())
         )?;
 
         match item.t {
             ItemType::Struct => {
                 return parse_struct_item(&item.tokens)
             },
-            _ => return Err(Error::WrongItemType{path: self.path, expected: ItemType::Struct, got: item.t.clone()}),
+            _ => return Err(Error::WrongItemType(query_source, self.path, ItemType::Struct, item.t.clone())),
         }
     }
 }

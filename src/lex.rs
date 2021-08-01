@@ -4,6 +4,14 @@ use crate::Query;
 use crate::Program;
 use std::sync::Arc;
 
+pub(crate) fn source_ref_from_tokens(tokens: &[Token]) -> SourceRef {
+    match (tokens.first(), tokens.last()) {
+        (Some(f), Some(l)) => {f.source_ref.to(&l.source_ref)},
+        (Some(f), None) => f.source_ref,
+        (_, _) => SourceRef::new(0, 0),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TokenType {
     Loop,
@@ -115,7 +123,7 @@ impl Lexer for StringLiteral {
             if let Some(close_idx) = content.find('"') {
                 return Ok(close_idx + 2)
             } else {
-                return Err(Error::StringNotClosed);
+                return Ok(0);
             }
         } else {
             return Ok(0);
@@ -206,7 +214,7 @@ pub(crate) fn lex(mut s: &str) -> Result<Vec<Token>> {
 
         s = remaining;
         match matched_lexer {
-            None => return Err(Error::UnknownToken),
+            None => return Err(Error::UnknownToken(source_ref)),
             Some(lexer) => tokens.push(Token{
                 t: lexer.make_token(token),
                 source_ref,
@@ -224,7 +232,7 @@ impl Query for GetTokenStream {
 }
 
 impl GetTokenStream {
-    pub(crate) async fn make(self, prog: Arc<Program>) -> <Self as Query>::Output {
+    pub(crate) async fn make(self, prog: Arc<Program>, _query_source: SourceRef) -> <Self as Query>::Output {
         lex(prog.get_src())
     }
 }

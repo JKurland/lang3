@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::storage::Storage;
 use crate::structs::GetStruct;
-use crate::{Result, Error, Program, make_query};
+use crate::{Error, Program, Result, SourceRef, make_query};
 use crate::function::ObjectHandle;
 use crate::itemise::ItemPath;
 
@@ -43,7 +43,7 @@ impl TypeExpression {
         }
     }
 
-    async fn do_substitutions(&mut self, types: &Storage<ObjectHandle, Type>, prog: Arc<Program>) -> Result<()> {
+    async fn do_substitutions(&mut self, types: &Storage<ObjectHandle, Type>, prog: Arc<Program>, source: SourceRef) -> Result<()> {
         match self {
             TypeExpression::Type(_) => {
                 Ok(())
@@ -60,15 +60,15 @@ impl TypeExpression {
 
                     for field in field_spec {
                         if let Type::Struct(ref item_path) = parent_type {
-                            let s = make_query!(prog, GetStruct{path: item_path.clone()}).await?;
+                            let s = make_query!(prog, GetStruct{path: item_path.clone()}, source).await?;
 
                             parent_type = match s.get_member(field) {
                                 Some(t) => t.clone(),
-                                None => return Err(Error::StructHasNoField(item_path.clone(), field.clone()))
+                                None => return Err(Error::StructHasNoField(source, item_path.clone(), field.clone()))
                             };
 
                         } else {
-                            return Err(Error::FieldAccessOnInvalidType(parent_type));
+                            return Err(Error::FieldAccessOnInvalidType(source, parent_type));
                         }
                     }
                     *self = TypeExpression::Type(parent_type);
@@ -84,6 +84,7 @@ impl TypeExpression {
 struct TypeEquation {
     lhs: TypeExpression,
     rhs: TypeExpression,
+    source: SourceRef,
 }
 
 #[derive(Debug)]
@@ -98,8 +99,8 @@ impl InferenceSystem {
         }
     }
 
-    pub(crate) fn add_eqn(&mut self, lhs: TypeExpression, rhs: TypeExpression) {
-        self.equations.push(TypeEquation{lhs, rhs});
+    pub(crate) fn add_eqn(&mut self, lhs: TypeExpression, rhs: TypeExpression, source: SourceRef) {
+        self.equations.push(TypeEquation{lhs, rhs, source});
     }
 
     pub(crate) async fn results(&mut self, never_objects: &[ObjectHandle], prog: Arc<Program>) -> Result<Storage<ObjectHandle, Type>> {
@@ -143,7 +144,7 @@ impl InferenceSystem {
             match (&eqn.lhs, &eqn.rhs) {
                 (TypeExpression::Type(a), TypeExpression::Type(b)) => {
                     if a != b {
-                        return Err(Error::TypeMismatch(a.clone(), b.clone()));
+                        return Err(Error::TypeMismatch(eqn.source, a.clone(), b.clone()));
                     }
                 }
                 _ => {}
@@ -187,8 +188,8 @@ impl InferenceSystem {
         }
 
         for eqn in &mut self.equations {
-            eqn.lhs.do_substitutions(types, prog.clone()).await?;
-            eqn.rhs.do_substitutions(types, prog.clone()).await?;
+            eqn.lhs.do_substitutions(types, prog.clone(), eqn.source).await?;
+            eqn.rhs.do_substitutions(types, prog.clone(), eqn.source).await?;
         }
 
         Ok(())
@@ -199,7 +200,7 @@ impl InferenceSystem {
             match (&eqn.lhs, &eqn.rhs) {
                 (TypeExpression::Placeholder(obj), rhs) => {
                     if rhs.depends_on(*obj) {
-                        return Err(Error::SelfReferentialType);
+                        return Err(Error::SelfReferentialType(eqn.source));
                     }
                 },
                 _ => {}

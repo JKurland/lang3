@@ -23,7 +23,7 @@ pub(crate) mod vm;
 pub(crate) mod storage;
 pub(crate) mod structs;
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Eq)]
 pub(crate) struct SourceRef {
     start: usize,
     end: usize,
@@ -83,10 +83,14 @@ impl SourceRef {
     pub(crate) fn empty_after(&self) -> Self {
         Self::new(self.end, 0)
     }
+
+    pub(crate) fn empty_before(&self) -> Self {
+        Self::new(self.start, 0)
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub(crate) enum Error {
+enum ErrorType {
     TypeNotInferred,
     NoSuchItem(ItemPath),
     WrongItemType{path: ItemPath, expected: ItemType, got: ItemType},
@@ -105,6 +109,8 @@ pub(crate) enum Error {
     ExpectedStructFieldName,
     InvalidComma,
     FunctionArgMustEvaluate,
+    StructFieldMustEvaluate,
+    ReturnValueMustEvaluate,
     SyntaxErrorExpected(Vec<&'static str>),
     SyntaxErrorUnexpected(Vec<&'static str>),
     UnexpectedEndOfFunction,
@@ -115,45 +121,328 @@ pub(crate) enum Error {
     UnexpectedEof,
     TypeMismatch(Type, Type),
     SelfReferentialType,
-    StructMemberNameConflict(String),
+    StructMemberNameConflict(String, SourceRef),
     UnexpectedEndOfStruct,
+    ExpectedFunctionSignature,
+}
+
+
+impl fmt::Display for ErrorType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ErrorType::TypeNotInferred => write!(f, "Type not inferred"),
+            ErrorType::NoSuchItem(path) => write!(f, "No such item: {:?}", path),
+            ErrorType::WrongItemType{path, expected, got} => write!(f, "Item {:?} was expected to be {:?}, was {:?}", path, expected, got),
+            ErrorType::StructHasNoField(path, field_name) => write!(f, "Struct {:?} has no field {}", path, field_name),
+            ErrorType::FieldAccessOnInvalidType(t) => write!(f, "Cannot do field access on object of type: {:?}", t),
+            ErrorType::ExpectedFn{path, got} => write!(f, "Expected fn on path {:?}, got {:?}", path, got),
+            ErrorType::UnreachableStatement => write!(f, "A statement in the code is unreachable"),
+            ErrorType::BreakOutsideOfLoop => write!(f, "Break statements are only allowed in loops"),
+            ErrorType::ParenGroupAsPrefix => write!(f, "Paren group not supported as prefix operator"),
+            ErrorType::BraceGroupAsPrefix => write!(f, "Brace group not supported as prefix operator"),
+            ErrorType::InvalidEmptyParens => write!(f, "Parens should not be empty"),
+            ErrorType::FunctionCallRequiresIdent => write!(f, "Function calls currently only support function by name"),
+            ErrorType::WrongNumberOfFunctionArgs{expected, got} => write!(f, "Wrong number of function args, expected: {}, got: {}", expected, got),
+            ErrorType::NoStructNameBeforeBrace => write!(f, "Expected struct name before brace group"),
+            ErrorType::StructInitRequiresIdent => write!(f, "Struct inits currently only support struct by name"),
+            ErrorType::ExpectedStructFieldName => write!(f, "Expected struct field name"),
+            ErrorType::InvalidComma => write!(f, "comma must be inside function arguments"),
+            ErrorType::FunctionArgMustEvaluate => write!(f, "Function arg must evaluate"),
+            ErrorType::StructFieldMustEvaluate => write!(f, "Struct field must evaluate"),
+            ErrorType::ReturnValueMustEvaluate => write!(f, "Return value must evaluate"),
+            ErrorType::SyntaxErrorExpected(tokens) => write!(f, "Syntax error, expected {:?}", tokens),
+            ErrorType::SyntaxErrorUnexpected(tokens) => write!(f, "Syntax error, unexpected {:?}", tokens),
+            ErrorType::UnexpectedEndOfFunction => write!(f, "Unexpected end of function"),
+            ErrorType::NameRedefined(name) => write!(f, "Name {} redefined", name),
+            ErrorType::UnknownName(name) => write!(f, "Unkown name {}", name),
+            ErrorType::StringNotClosed => write!(f, "String literal not closed"),
+            ErrorType::UnknownToken => write!(f, "Unkown token"),
+            ErrorType::UnexpectedEof => write!(f, "Unexpected end of file"),
+            ErrorType::TypeMismatch(a, b) => write!(f, "Type mismatch, {:?} and {:?}", a, b),
+            ErrorType::SelfReferentialType => write!(f, "Could not infer types, self referential type"),
+            ErrorType::StructMemberNameConflict(name, other_source_ref) => write!(f, "Two struct members have the same name {}: {:?}", name, other_source_ref),
+            ErrorType::UnexpectedEndOfStruct => write!(f, "Unexpected end of struct"),
+            ErrorType::ExpectedFunctionSignature => write!(f, "Expected function signature"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) struct Error {
+    t: ErrorType,
+    source_ref: SourceRef,
 }
 
 impl std::error::Error for Error {}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::TypeNotInferred => write!(f, "Type not inferred"),
-            Error::NoSuchItem(path) => write!(f, "No such item: {:?}", path),
-            Error::WrongItemType{path, expected, got} => write!(f, "Item {:?} was expected to be {:?}, was {:?}", path, expected, got),
-            Error::StructHasNoField(path, field_name) => write!(f, "Struct {:?} has no field {}", path, field_name),
-            Error::FieldAccessOnInvalidType(t) => write!(f, "Cannot do field access on object of type: {:?}", t),
-            Error::ExpectedFn{path, got} => write!(f, "Expected fn on path {:?}, got {:?}", path, got),
-            Error::UnreachableStatement => write!(f, "A statement in the code is unreachable"),
-            Error::BreakOutsideOfLoop => write!(f, "Break statements are only allowed in loops"),
-            Error::ParenGroupAsPrefix => write!(f, "Paren group not supported as prefix operator"),
-            Error::BraceGroupAsPrefix => write!(f, "Brace group not supported as prefix operator"),
-            Error::InvalidEmptyParens => write!(f, "Parens should not be empty"),
-            Error::FunctionCallRequiresIdent => write!(f, "Function calls currently only support function by name"),
-            Error::WrongNumberOfFunctionArgs{expected, got} => write!(f, "Wrong number of function args, expected: {}, got: {}", expected, got),
-            Error::NoStructNameBeforeBrace => write!(f, "Expected struct name before brace group"),
-            Error::StructInitRequiresIdent => write!(f, "Struct inits currently only support struct by name"),
-            Error::ExpectedStructFieldName => write!(f, "Expected struct field name"),
-            Error::InvalidComma => write!(f, "comma must be inside function arguments"),
-            Error::FunctionArgMustEvaluate => write!(f, "Function arg must evaluate"),
-            Error::SyntaxErrorExpected(tokens) => write!(f, "Syntax error, expected {:?}", tokens),
-            Error::SyntaxErrorUnexpected(tokens) => write!(f, "Syntax error, unexpected {:?}", tokens),
-            Error::UnexpectedEndOfFunction => write!(f, "Unexpected end of function"),
-            Error::NameRedefined(name) => write!(f, "Name {} redefined", name),
-            Error::UnknownName(name) => write!(f, "Unkown name {}", name),
-            Error::StringNotClosed => write!(f, "String literal not closed"),
-            Error::UnknownToken => write!(f, "Unkown token"),
-            Error::UnexpectedEof => write!(f, "Unexpected end of file"),
-            Error::TypeMismatch(a, b) => write!(f, "Type mismatch, {:?} and {:?}", a, b),
-            Error::SelfReferentialType => write!(f, "Could not infer types, self referential type"),
-            Error::StructMemberNameConflict(name) => write!(f, "Two struct members have the same name {}", name),
-            Error::UnexpectedEndOfStruct => write!(f, "Unexpected end of struct"),
+        write!(f, "Error: {:?}\n    {}", self.source_ref, self.t)
+    }
+}
+
+impl Error {
+    #[allow(non_snake_case)]
+    fn TypeNotInferred(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::TypeNotInferred,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn NoSuchItem(source_ref: SourceRef, item: ItemPath) -> Self {
+        Self{
+            t: ErrorType::NoSuchItem(item),
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn WrongItemType(source_ref: SourceRef, path: ItemPath, expected: ItemType, got: ItemType) -> Self {
+        Self{
+            t: ErrorType::WrongItemType{path, expected, got},
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn StructHasNoField(source_ref: SourceRef, item: ItemPath, field: String) -> Self {
+        Self{
+            t: ErrorType::StructHasNoField(item, field),
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn FieldAccessOnInvalidType(source_ref: SourceRef, t: Type) -> Self {
+        Self{
+            t: ErrorType::FieldAccessOnInvalidType(t),
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn ExpectedFn(source_ref: SourceRef, path: ItemPath, got: ItemType) -> Self {
+        Self{
+            t: ErrorType::ExpectedFn{path, got},
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn UnreachableStatement(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::UnreachableStatement,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn BreakOutsideOfLoop(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::BreakOutsideOfLoop,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn ParenGroupAsPrefix(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::ParenGroupAsPrefix,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn BraceGroupAsPrefix(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::BraceGroupAsPrefix,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn InvalidEmptyParens(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::InvalidEmptyParens,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn FunctionCallRequiresIdent(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::FunctionCallRequiresIdent,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn WrongNumberOfFunctionArgs(source_ref: SourceRef, expected: usize, got: usize) -> Self {
+        Self{
+            t: ErrorType::WrongNumberOfFunctionArgs{expected, got},
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn NoStructNameBeforeBrace(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::NoStructNameBeforeBrace,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn StructInitRequiresIdent(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::StructInitRequiresIdent,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn ExpectedStructFieldName(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::ExpectedStructFieldName,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn InvalidComma(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::InvalidComma,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn FunctionArgMustEvaluate(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::FunctionArgMustEvaluate,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn StructFieldMustEvaluate(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::StructFieldMustEvaluate,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn ReturnValueMustEvaluate(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::ReturnValueMustEvaluate,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn SyntaxErrorExpected(source_ref: SourceRef, expected: Vec<&'static str>) -> Self {
+        Self{
+            t: ErrorType::SyntaxErrorExpected(expected),
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn SyntaxErrorUnexpected(source_ref: SourceRef, unexpected: Vec<&'static str>) -> Self {
+        Self{
+            t: ErrorType::SyntaxErrorUnexpected(unexpected),
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn UnexpectedEndOfFunction(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::UnexpectedEndOfFunction,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn NameRedefined(source_ref: SourceRef, name: String) -> Self {
+        Self{
+            t: ErrorType::NameRedefined(name),
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn UnknownName(source_ref: SourceRef, name: String) -> Self {
+        Self{
+            t: ErrorType::UnknownName(name),
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn StringNotClosed(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::StringNotClosed,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn UnknownToken(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::UnknownToken,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn UnexpectedEof(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::UnexpectedEof,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn TypeMismatch(source_ref: SourceRef, a: Type, b: Type) -> Self {
+        Self{
+            t: ErrorType::TypeMismatch(a, b),
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn SelfReferentialType(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::SelfReferentialType,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn StructMemberNameConflict(source_ref: SourceRef, name: String, other_source: SourceRef) -> Self {
+        Self{
+            t: ErrorType::StructMemberNameConflict(name, other_source),
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn UnexpectedEndOfStruct(source_ref: SourceRef) -> Self {
+        Self{
+            t: ErrorType::UnexpectedEndOfStruct,
+            source_ref,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn ExpectedFunctionSignature(source_ref: SourceRef) -> Self {
+        Self {
+            t: ErrorType::ExpectedFunctionSignature,
+            source_ref
         }
     }
 }
@@ -280,12 +569,13 @@ pub(crate) trait Query: Send + Sync + Clone + Hash + PartialEq + 'static {
 
 #[macro_export]
 macro_rules! make_query {
-    ($prog:expr, $query:expr) => { 
+    ($prog:expr, $query:expr, $query_source:expr) => { 
         {
             let prog: Arc<$crate::Program> = ($prog).clone();
             let query = $query;
+            let query_source = $query_source;
             async move {
-                prog.run_query(query.clone(), query.make(prog.clone())).await
+                prog.run_query(query.clone(), query.make(prog.clone(), query_source)).await
             }
         }
     };
@@ -318,7 +608,7 @@ d
         let prog = Arc::new(Program::new(src.to_string()));
         let program = block_on(make_query!(&prog, GetFunctionVmProgram{
             path: ItemPath::new("main"),
-        }))?;
+        }, SourceRef::new(0,0)))?;
         //dbg!(&program);
         let mut vm = vm::Vm::new(8092);
         Ok(vm.run(&program) as u32)
